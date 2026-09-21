@@ -16,7 +16,7 @@ import {
   type ViewDto,
   type ViewKind,
 } from "./api";
-import { render, renderAdd, renderSync, renderSyncSettings, renderNotes, mmdd, weekdayCn, isoLine, TOUCH_DEVICE, type FoldState } from "./render";
+import { render, renderAdd, renderSync, renderSyncSettings, renderNotes, mmdd, weekdayCn, isoLine, TOUCH_DEVICE, formatHms, timerDisplaySecs, TIMER_CAP_SECS, taskKey, holdSortOrder, releaseSortOrder, type FoldState } from "./render";
 
 const SINK_IDLE_MS = 5000;
 const ADD_CAT_CYCLE: Array<string | null> = ["work", "personal", null];
@@ -76,7 +76,8 @@ let refreshId = 0;
 let loadError: string | null = null;
 let mutationPending = false;
 let refreshDeferred = false;
-let editor: { input: HTMLInputElement; cancel: () => void } | null = null;
+// v0.8 多行编辑：录入/编辑均为 textarea（Shift+回车换行）
+let editor: { input: HTMLInputElement | HTMLTextAreaElement; cancel: () => void } | null = null;
 const errorMessage = document.createElement("div");
 errorMessage.setAttribute("role", "alert");
 errorMessage.style.cssText = "padding:8px 16px;color:var(--ink, #442b28);font-size:12px;white-space:pre-wrap";
@@ -177,7 +178,7 @@ let leftoversCache: Awaited<ReturnType<typeof api.getLeftovers>> | null = null;
 
 function rerender(): void {
   if (editor) return;
-  closeCtx(); // 行号可能因后台 pull 变化，菜单持有的 ctxLine 即刻失效
+  closeCtx(); // 行号可能因后台 pull 变化，菜单持有的捕获上下文即刻失效
   render(
     root,
     uiState(),
@@ -189,6 +190,7 @@ function rerender(): void {
         }
       : null,
   );
+  syncTicker();
   requestAnimationFrame(measureHeight);
 }
 
@@ -284,6 +286,52 @@ function taskAt(line: number): TaskView | undefined {
   return app.view?.tasks[line];
 }
 
+// ---- v0.8 计时 ticker（§2.8）----
+// 每秒从累计值 + 时间戳重算（非 counter++）；只改 Text 节点 data，不 render/refresh/IPC；
+// 存在未封顶的有效 Doing 且页面可见时才运行 interval；重渲后按 DOM 重新定位。
+
+let tickerId: number | undefined;
+
+function tickTimers(): void {
+  const timers = root.querySelectorAll<HTMLElement>(".timer[data-timer-line]");
+  if (timers.length === 0) return;
+  const now = Date.now();
+  for (const tm of timers) {
+    const t = app.view?.tasks[Number(tm.dataset.timerLine)];
+    if (!t) continue;
+    const text = formatHms(timerDisplaySecs(t, now));
+    const first = tm.firstChild;
+    if (first instanceof Text && first.data !== text) first.data = text;
+  }
+}
+
+function hasTickingTimer(): boolean {
+  const now = Date.now();
+  return !!app.view?.tasks.some(t =>
+    t.status === "doing" && t.timer_started_at !== null && timerDisplaySecs(t, now) < TIMER_CAP_SECS);
+}
+
+function syncTicker(): void {
+  const active = !document.hidden && hasTickingTimer();
+  if (active && tickerId === undefined) {
+    tickerId = window.setInterval(tickTimers, 1000);
+  } else if (!active && tickerId !== undefined) {
+    window.clearInterval(tickerId);
+    tickerId = undefined;
+  }
+  if (!document.hidden) tickTimers(); // 含从后台标签恢复时的立即重算
+}
+
+document.addEventListener("visibilitychange", syncTicker);
+
+/** 完成沉底/状态切换重排后，把焦点恢复到同一来源任务的指定控件（不能拿重排前 row_idx）。 */
+function focusTaskControl(t: TaskView, selector: string): void {
+  const idx = app.view?.tasks.findIndex(x =>
+    x.line_idx === t.line_idx && x.source.kind === t.source.kind && x.source.date === t.source.date);
+  if (idx === undefined || idx < 0) return;
+  root.querySelector<HTMLElement>(`.item[data-line="${idx}"] ${selector}`)?.focus();
+}
+
 // Notebook requests carry their own ID; switching cannot redirect a pending write.
 const notebookNav = root.querySelector<HTMLElement>(".notebook-nav")!;
 const notebookToggle = root.querySelector<HTMLButtonElement>("#notebook-toggle")!;
@@ -353,11 +401,12 @@ function loadNoteSquare(): Promise<void> {
       const day = dto.days.find(day => day.date === date);
       if (!day) return;
       const dirty = noteSquare.value !== noteSquare.dataset.loaded;
-      if (!dirty && noteSquare.value !== day.content) noteSquare.value = day.content;
+      if (dirty) return;
+      if (noteSquare.value !== day.content) noteSquare.value = day.content;
       noteSquare.dataset.loaded = day.content;
       noteSquare.dataset.baseVersion = day.base_version;
       cacheNoteSquare(date, day.content, notebookId);
-      notesStatus.textContent = dirty ? "仍有未保存的修改" : "";
+      notesStatus.textContent = "";
     } catch (error) {
       if (id === squareRequestId) notesStatus.textContent = error instanceof Error ? error.message : String(error);
     } finally {
@@ -399,21 +448,21 @@ async function loadNotes(): Promise<void> {
   }
 }
 
-async function saveNote(input: HTMLTextAreaElement): Promise<void> {
+async function saveNote(input: HTMLTextAreaElement): Promise<boolean> {
   if (!TOUCH_DEVICE && input === noteSquare && (squareLoading || !input.dataset.baseVersion)) {
     await loadNoteSquare();
-    if (!input.dataset.baseVersion) return;
+    if (!input.dataset.baseVersion) return false;
   }
   // Blur and collapse can arrive together; serialize writes for each day.
   if (input.dataset.saving === "true") {
     if (input.value !== input.dataset.savingContent) input.dataset.saveAgain = "true";
-    return;
+    return false;
   }
-  if (input.value === input.dataset.loaded) return;
+  if (input.value === input.dataset.loaded) return true;
   const content = input.value;
   if (new TextEncoder().encode(content).byteLength > 64000) {
     notesStatus.textContent = "速记内容超过 64000 字节，请缩短后保存";
-    return;
+    return false;
   }
   const notebookId = input.dataset.notebookId!;
   const date = input.dataset.noteDate!;
@@ -447,6 +496,7 @@ async function saveNote(input: HTMLTextAreaElement): Promise<void> {
     delete input.dataset.saveAgain;
     if (saved && again) void saveNote(input);
   }
+  return saved;
 }
 
 function closeNotes(restoreFocus = true): void {
@@ -719,28 +769,65 @@ function showUndo(c: EditContext, r: DeleteResult, label: string): void {
   undoTimer = window.setTimeout(hideUndo, 3000);
 }
 
-// ---- 右键菜单：#doing / #blocked 写入（F7；#overdue 只读，不在此写入） ----
+// ---- 右键菜单：v0.8 只剩「删除这条任务」（状态走左侧状态钮，受阻已随 Win UI 删除） ----
 
-let ctxLine = -1;
+let ctxTarget: { ctx: EditContext; label: string } | null = null;
 
 function ctxMenu(): HTMLElement {
   return root.querySelector<HTMLElement>("#ctx")!;
 }
 
 function closeCtx(): void {
-  ctxLine = -1;
+  ctxTarget = null;
   ctxMenu().hidden = true;
 }
 
-/** 编辑文本：.txt → 单行输入框，Enter/blur 提交，Esc 取消。 */
+/** 打开单项删除菜单；菜单按钮 data-action="ctx-delete" 回到全局委托。 */
+function openDeleteMenu(item: HTMLElement, x: number, y: number): void {
+  const line = Number(item.dataset.line);
+  const t = taskAt(line);
+  const ctx = context(line);
+  if (!t || !ctx || editor || mutationPending) return;
+  ctxTarget = { ctx, label: t.display };
+  const menu = ctxMenu();
+  const b = document.createElement("button");
+  b.className = "ctx-item";
+  b.textContent = "删除这条任务";
+  b.dataset.action = "ctx-delete";
+  menu.replaceChildren(b);
+  menu.hidden = false;
+  // 光标附近展开，钳制在纸面内（贴纸窗口只有 372px 宽）
+  const rect = root.getBoundingClientRect();
+  const mx = Math.max(0, Math.min(x - rect.left, root.clientWidth - menu.offsetWidth - 6));
+  const my = Math.max(0, Math.min(y - rect.top, root.clientHeight - menu.offsetHeight - 6));
+  menu.style.left = `${mx}px`;
+  menu.style.top = `${my}px`;
+  b.focus();
+}
+
+/** v0.8 多行拆行规则：首行=content，其余=子行；丢弃末尾连续空白子行。 */
+function splitDraft(value: string): { content: string; subs: string[] } {
+  const lines = value.split("\n");
+  const subs = lines.slice(1);
+  while (subs.length > 0 && subs[subs.length - 1].trim() === "") subs.pop();
+  return { content: lines[0].trim(), subs };
+}
+
+/** 编辑文本：.txt → textarea（Shift+Enter 换行），Enter/blur 提交，Esc 取消。
+ * 编辑期间隐藏旧子行容器，textarea 里以首行+子行回填，保存时整体回写。 */
 function beginEdit(line: number, txt: HTMLElement): void {
   const task = taskAt(line);
   const c = context(line);
   if (!task || task.checked || !c || editor) return;
-  const input = document.createElement("input");
+  const original = [task.content, ...task.sub_lines].join("\n");
+  const input = document.createElement("textarea");
   input.className = "txt-input";
-  input.setAttribute("aria-label", "编辑事项，Enter 保存，Esc 取消");
-  input.value = task.content;
+  input.rows = 1;
+  input.setAttribute("aria-label", "编辑事项，Enter 保存，Shift+Enter 换行，Esc 取消");
+  input.value = original;
+  const autoGrow = () => { input.style.height = "auto"; input.style.height = `${input.scrollHeight}px`; };
+  const subsBox = txt.closest(".body")?.querySelector<HTMLElement>(".subs");
+  if (subsBox) subsBox.hidden = true;
   let pending = false;
   const cancel = () => {
     if (pending) return;
@@ -749,22 +836,24 @@ function beginEdit(line: number, txt: HTMLElement): void {
   };
   editor = { input, cancel };
   txt.replaceWith(input);
+  autoGrow();
   input.focus();
   input.setSelectionRange(input.value.length, input.value.length);
   const commit = async () => {
     if (pending || editor?.input !== input) return;
-    const next = input.value.trim();
-    if (!next || next === task.content) { cancel(); return; }
+    const { content, subs } = splitDraft(input.value);
+    if (!content || input.value === original) { cancel(); return; }
     pending = true;
     input.readOnly = true;
-    const ok = await edit((ctx) => api.setContent(ctx.notebookId, ctx.kind, ctx.lineIdx, next, ctx.baseVersion, ctx.date), c);
+    const ok = await edit((ctx) => api.setContent(ctx.notebookId, ctx.kind, ctx.lineIdx, content, ctx.baseVersion, ctx.date, subs), c);
     pending = false;
     input.readOnly = false;
     if (ok) { finishEditor(); await refresh(); }
   };
+  input.addEventListener("input", autoGrow);
   input.addEventListener("keydown", (ev) => {
     if (ev.isComposing || ev.keyCode === 229) return;
-    if (ev.key === "Enter") {
+    if (ev.key === "Enter" && !ev.shiftKey) {
       ev.preventDefault();
       void commit();
     } else if (ev.key === "Escape") {
@@ -775,7 +864,7 @@ function beginEdit(line: number, txt: HTMLElement): void {
   input.addEventListener("blur", () => void commit());
 }
 
-/** 添加框：Enter 提交，Tab 循环分类，Esc 收起。 */
+/** 添加框：Enter 提交（Shift+Enter 换行落子行），Tab 循环分类，Esc 收起。 */
 function beginAdd(): void {
   const c = context();
   if (!c || editor) return;
@@ -783,14 +872,18 @@ function beginAdd(): void {
   slot.replaceChildren();
   const wrap = document.createElement("div");
   wrap.className = "add-open";
-  const input = document.createElement("input");
+  const input = document.createElement("textarea");
   input.className = "add-input";
-  input.setAttribute("aria-label", TOUCH_DEVICE ? "新事项" : "新事项，Enter 保存，Tab 切分类，Esc 取消");
+  input.rows = 1;
+  input.setAttribute("aria-label", TOUCH_DEVICE ? "新事项" : "新事项，Enter 保存，Shift+Enter 换行，Tab 切分类，Esc 取消");
   const placeholder = () => {
     const cat = ADD_CAT_CYCLE[app.addCatIdx];
-    input.placeholder = TOUCH_DEVICE ? `新事项 · ${ADD_CAT_LABEL[cat ?? ""]}` : `新事项（Enter 落 [${ADD_CAT_LABEL[cat ?? ""]}]，Tab 切分类）`;
+    input.placeholder = TOUCH_DEVICE
+      ? `新事项 · ${ADD_CAT_LABEL[cat ?? ""]}`
+      : `新事项（Enter 落 [${ADD_CAT_LABEL[cat ?? ""]}]，Shift+Enter 换行，Tab 切分类）`;
   };
   placeholder();
+  const autoGrow = () => { input.style.height = "auto"; input.style.height = `${input.scrollHeight}px`; };
   wrap.append(input);
   if (TOUCH_DEVICE) {
     const category = document.createElement("button");
@@ -816,15 +909,16 @@ function beginAdd(): void {
     renderAdd(root, uiState());
   };
   editor = { input, cancel: close };
+  autoGrow();
   input.focus();
   const submit = async () => {
     if (pending || editor?.input !== input) return;
-    const text = input.value.trim();
+    const { content: text, subs } = splitDraft(input.value);
     if (!text) { close(); return; }
     pending = true;
     input.readOnly = true;
     const cat = ADD_CAT_CYCLE[app.addCatIdx];
-    const ok = await edit((ctx) => api.addTask(ctx.notebookId, ctx.kind, cat, null, text, ctx.baseVersion, ctx.date), c);
+    const ok = await edit((ctx) => api.addTask(ctx.notebookId, ctx.kind, cat, null, text, ctx.baseVersion, ctx.date, subs), c);
     pending = false;
     input.readOnly = false;
     if (ok) {
@@ -840,9 +934,10 @@ function beginAdd(): void {
       input.focus();
     }
   };
+  input.addEventListener("input", autoGrow);
   input.addEventListener("keydown", (ev) => {
     if (ev.isComposing || ev.keyCode === 229) return;
-    if (ev.key === "Enter") {
+    if (ev.key === "Enter" && !ev.shiftKey) {
       ev.preventDefault();
       void submit();
     } else if (ev.key === "Tab") {
@@ -858,6 +953,41 @@ function beginAdd(): void {
 }
 
 const PRIO_CYCLE = ["P0", "P1", "P2", "P3"];
+
+// 连点换档期间显示序冻结（render.ts frozenOrder）。1.5 秒：盖得住连点节奏
+// （点击间隔通常 <1s），停手后近立即重排（初版 5s，用户反馈偏慢改短）。
+const PRIO_RESORT_DELAY_MS = 1500;
+let sortHoldTimer: number | undefined;
+
+/** 优先级调整前调用：锁定当前显示序并（重）启动解冻计时，到点解锁重排一次。 */
+function holdSortResort(): void {
+  const tasks = app.view?.tasks ?? [];
+  const keys: string[] = [];
+  for (const item of root.querySelectorAll<HTMLElement>(".item")) {
+    const t = tasks[Number(item.dataset.line)];
+    if (t) keys.push(taskKey(t));
+  }
+  holdSortOrder(keys);
+  if (sortHoldTimer !== undefined) window.clearTimeout(sortHoldTimer);
+  sortHoldTimer = window.setTimeout(() => {
+    sortHoldTimer = undefined;
+    releaseSortOrder();
+    rerender();
+  }, PRIO_RESORT_DELAY_MS);
+}
+
+/** 删除任务并尽力弹撤销气泡（触摸行内 ✕ 与右键菜单共用）。 */
+function deleteTaskFlow(captured: EditContext, label: string): void {
+  void (async () => {
+    let deleted: DeleteResult | undefined;
+    const ok = await edit(async (c) => {
+      deleted = await api.deleteTask(c.notebookId, c.kind, c.lineIdx, c.baseVersion, c.date);
+      return deleted;
+    }, captured);
+    if (ok && deleted && isCurrent(captured) && sourceVersion(captured) === deleted.base_version)
+      showUndo(captured, deleted, label);
+  })();
+}
 
 /** 全局事件委托：所有交互走 data-action。 */
 root.addEventListener("click", (ev) => {
@@ -880,8 +1010,26 @@ root.addEventListener("click", (ev) => {
       if (TOUCH_DEVICE) void refresh();
       break;
     case "check": {
+      // 行尾完成勾选框：勾=done 结算冻结；取消=复活回 paused 冻结不清零
+      // （v0.8.1：复活停暂停而非进行中，点状态钮才开始续计）。
       const t = taskAt(line);
-      if (t) void edit((c) => api.setChecked(c.notebookId, c.kind, c.lineIdx, !t.checked, c.baseVersion, c.date), context(line));
+      if (!t) break;
+      const target = t.checked ? "paused" : "done";
+      void (async () => {
+        const ok = await edit((c) => api.setStatus(c.notebookId, c.kind, c.lineIdx, target, c.baseVersion, c.date), context(line));
+        if (ok) focusTaskControl(t, ".cbx"); // 完成沉底重排后焦点跟回同一任务
+      })();
+      break;
+    }
+    case "status": {
+      // 左侧状态钮：单击只在 待开始→进行中 / 进行中⇄暂停 间循环；完成态零 IPC。
+      const t = taskAt(line);
+      if (!t || t.status === "done") break;
+      const target = t.status === "doing" ? "paused" : "doing";
+      void (async () => {
+        const ok = await edit((c) => api.setStatus(c.notebookId, c.kind, c.lineIdx, target, c.baseVersion, c.date), context(line));
+        if (ok) focusTaskControl(t, ".st");
+      })();
       break;
     }
     case "prio": {
@@ -889,6 +1037,7 @@ root.addEventListener("click", (ev) => {
       if (!t) break;
       const cur = t.priority ? PRIO_CYCLE.indexOf(t.priority) : -1;
       const next = PRIO_CYCLE[(cur + 1) % PRIO_CYCLE.length];
+      holdSortResort(); // 先锁当前显示序再换档：连点期间行不跳位，停 1.5 秒后重排
       void edit((c) => api.setPriority(c.notebookId, c.kind, c.lineIdx, next, c.baseVersion, c.date), context(line));
       break;
     }
@@ -896,70 +1045,19 @@ root.addEventListener("click", (ev) => {
       const t = taskAt(line);
       const captured = context(line);
       if (!t || !captured) break;
-      const label = t.display;
-      void (async () => {
-        let deleted: DeleteResult | undefined;
-        const ok = await edit(async (c) => {
-          deleted = await api.deleteTask(c.notebookId, c.kind, c.lineIdx, c.baseVersion, c.date);
-          return deleted;
-        }, captured);
-        if (ok && deleted && isCurrent(captured) && sourceVersion(captured) === deleted.base_version)
-          showUndo(captured, deleted, label);
-      })();
+      deleteTaskFlow(captured, t.display);
+      break;
+    }
+    case "ctx-delete": {
+      const pending2 = ctxTarget;
+      closeCtx();
+      if (pending2) deleteTaskFlow(pending2.ctx, pending2.label);
       break;
     }
     case "undo": {
       const p = undoPending;
       hideUndo();
       if (p && isCurrent(p)) void edit((c) => api.restoreDeleted(c.notebookId, c.kind, p.lineIdx, p.removed, c.baseVersion, c.date), p);
-      break;
-    }
-    case "ctx-doing": {
-      const t = taskAt(ctxLine);
-      const line2 = ctxLine;
-      closeCtx();
-      if (t) void edit((c) => api.setFlag(c.notebookId, c.kind, c.lineIdx, "doing", !t.doing, c.baseVersion, c.date), context(line2));
-      break;
-    }
-    case "ctx-unblock": {
-      const line2 = ctxLine;
-      closeCtx();
-      void edit((c) => api.setBlocked(c.notebookId, c.kind, c.lineIdx, null, c.baseVersion, c.date), context(line2));
-      break;
-    }
-    case "ctx-blocked": {
-      // 菜单原位换成原因输入框（Enter 保存 / Esc 取消）
-      const menu = ctxMenu();
-      const line = ctxLine;
-      const captured = context(line);
-      if (!captured || editor) break;
-      menu.replaceChildren();
-      const input = document.createElement("input");
-      input.className = "ctx-input";
-      input.setAttribute("aria-label", "受阻原因");
-      input.placeholder = "受阻原因（Enter 保存）";
-      input.value = taskAt(line)?.blocked_reason ?? "";
-      menu.append(input);
-      const cancel = () => { finishEditor(); closeCtx(); };
-      editor = { input, cancel };
-      input.focus();
-      input.setSelectionRange(input.value.length, input.value.length);
-      input.addEventListener("keydown", (ev2) => {
-        ev2.stopPropagation();
-        if (ev2.isComposing || ev2.keyCode === 229) return;
-        if (ev2.key === "Enter") {
-          ev2.preventDefault();
-          const reason = input.value.trim();
-          if (reason && !input.readOnly) void (async () => {
-            input.readOnly = true;
-            const ok = await edit((c) => api.setBlocked(c.notebookId, c.kind, c.lineIdx, reason, c.baseVersion, c.date), captured);
-            input.readOnly = false;
-            if (ok) { cancel(); await refresh(); }
-          })();
-        } else if (ev2.key === "Escape") {
-          if (!input.readOnly) cancel();
-        }
-      });
       break;
     }
     case "edit": {
@@ -1063,42 +1161,28 @@ root.querySelector(".tabs")!.addEventListener("click", (ev) => {
   navigate();
 });
 
-/** 右键任务行 → 状态标签菜单（#doing 切换 / #blocked 设因）。 */
+/** 右键任务行 → 单项删除菜单（完成项也可删；编辑/写入中不弹）。 */
 root.addEventListener("contextmenu", (ev) => {
   const item = (ev.target as HTMLElement).closest<HTMLElement>(".item");
   if (!item) return;
   ev.preventDefault();
-  const t = taskAt(Number(item.dataset.line));
-  if (!t || t.checked || editor || mutationPending) return;
-
-  ctxLine = t.row_idx;
-  const menu = ctxMenu();
-  const mk = (label: string, act: string) => {
-    const b = document.createElement("button");
-    b.className = "ctx-item";
-    b.textContent = label;
-    b.dataset.action = act;
-    return b;
-  };
-  menu.replaceChildren(
-    mk(t.doing ? "○ 取消进行中" : "◉ 标记进行中", "ctx-doing"),
-    mk(t.blocked_reason ? `⛔ 受阻：改原因` : "⛔ 标记受阻…", "ctx-blocked"),
-  );
-  if (t.blocked_reason) menu.append(mk("✓ 解除受阻", "ctx-unblock"));
-  menu.hidden = false;
-
-  // 光标附近展开，钳制在纸面内（贴纸窗口只有 372px 宽）
-  const rect = root.getBoundingClientRect();
-  const x = Math.max(0, Math.min(ev.clientX - rect.left, root.clientWidth - menu.offsetWidth - 6));
-  const y = Math.max(0, Math.min(ev.clientY - rect.top, root.clientHeight - menu.offsetHeight - 6));
-  menu.style.left = `${x}px`;
-  menu.style.top = `${y}px`;
+  openDeleteMenu(item, ev.clientX, ev.clientY);
 });
 
-// 菜单外点击关闭（pointerdown 先于 click 到达）
+// 键盘等效：Menu / Shift+F10 对焦点所在任务行开同一菜单
+window.addEventListener("keydown", (ev) => {
+  if (ev.isComposing || ev.keyCode === 229) return;
+  if (ev.key !== "ContextMenu" && !(ev.key === "F10" && ev.shiftKey)) return;
+  const item = (document.activeElement as HTMLElement | null)?.closest<HTMLElement>(".item");
+  if (!item) return;
+  ev.preventDefault();
+  const r = item.getBoundingClientRect();
+  openDeleteMenu(item, r.left, r.bottom);
+});
+
+// 菜单外点击关闭（pointerdown 先于 click 到达；点菜单项本身不在此关）
 window.addEventListener("pointerdown", (ev) => {
   if (ctxMenu().hidden) return;
-  if (editor?.input.classList.contains("ctx-input")) return;
   if (!(ev.target as HTMLElement).closest("#ctx")) closeCtx();
 }, true);
 
@@ -1215,10 +1299,9 @@ if (TOUCH_DEVICE) {
       close: () => { syncSettingsForm.hidden = true; syncPat.value = ""; syncSettingsToggle.setAttribute("aria-expanded", "false"); } },
     { node: appearance, open: () => appearance.open, close: () => { appearance.open = false; } },
     { node: datePick, open: () => !datePick.hidden, close: () => { datePick.hidden = true; datePick.blur(); } },
-    { node: ctxMenu(), open: () => !ctxMenu().hidden,
-      close: () => { if (editor?.input.classList.contains("ctx-input")) editor.cancel(); else closeCtx(); } },
-    { node: root.querySelector<HTMLElement>("#add-slot")!,
-      open: () => !!editor && !editor.input.classList.contains("ctx-input"), close: () => editor?.cancel() },
+    { node: ctxMenu(), open: () => !ctxMenu().hidden, close: () => closeCtx() },
+    // 任意行内编辑器（任务 textarea / 添加框）都算这个面板打开，返回键统一走 cancel。
+    { node: root.querySelector<HTMLElement>("#add-slot")!, open: () => !!editor, close: () => editor?.cancel() },
   ];
   type Panel = typeof panels[number];
   let active: Panel[] = [];
@@ -1347,8 +1430,12 @@ if (winCloseBtn && !/android/i.test(navigator.userAgent)) {
 }
 
 async function closeWindow(): Promise<void> {
-  if (!TOUCH_DEVICE && noteSquare.dataset.baseVersion) {
-    try { await saveNote(noteSquare); } catch { /* 草稿留在输入框与缓存，下次启动可见 */ }
+  if (!TOUCH_DEVICE) {
+    const saved = await saveNote(noteSquare).catch(() => false);
+    if (!saved) {
+      cacheNoteSquare(noteSquare.dataset.noteDate ?? todayStr(), noteSquare.value,
+        noteSquare.dataset.notebookId ?? app.notebookId);
+    }
   }
   const deadline = Date.now() + 3000;
   while (Date.now() < deadline && (mutationPending || noteSquare.dataset.saving === "true")) {

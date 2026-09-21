@@ -14,6 +14,9 @@
   --ok: #3f7d4e;
   --wash: rgba(22, 24, 26, 0.06);
   --paper-pattern: none;
+  /* 状态钮与完成框均以符号表意，完成前后不换底色或边框色。
+     字号乘数（themes.ts 按档位覆写 --fs-scale）。 */
+  --fs-scale: 1;
   --mono: ui-monospace, Consolas, "Cascadia Mono", monospace;
   --sans: "Segoe UI", "Microsoft YaHei", sans-serif;
   color-scheme: light;
@@ -258,21 +261,24 @@ button:focus-visible, input:focus-visible, summary:focus-visible, [tabindex]:foc
 
 .item {
   display: flex;
-  gap: 8px;
+  gap: 4px; /* v0.8.1 优先级/状态/正文/完成框四控件更紧凑 */
   padding: 8px 12px;
   border-bottom: 1px solid var(--hairline);
   align-items: flex-start;
 }
 .item:last-child { border-bottom: none; }
 
-/* 优先级：mono 文本档（P0 唯一红） */
+/* v0.8 行内四控件（优先级档/状态钮/正文/完成框）等高于正文首行：
+   高度 = 13px * 1.55 * 字号乘数，内容垂直居中 → 中线对齐。 */
 .bar {
   flex: none;
-  min-width: 20px;
-  margin-top: 3px;
+  min-width: auto;
+  height: calc(13px * 1.55 * var(--fs-scale));
+  display: flex;
+  align-items: center;
   font-family: var(--mono);
   font-size: 10px;
-  text-align: center;
+  text-align: left;
   color: var(--ink-3);
   cursor: pointer;
   user-select: none;
@@ -283,59 +289,114 @@ button:focus-visible, input:focus-visible, summary:focus-visible, [tabindex]:foc
 .bar.p2 { color: var(--ink-2); }
 .bar.pnone { opacity: 0.55; }
 
-.cbx {
+/* 左侧状态钮（v0.8 四态合一）：待开始 ○ / 进行中 ▶ / 暂停 ‖ / 完成 ✓（禁点）。
+   单击循环只在进行中⇄暂停（待开始首点→进行中）；完成走行尾勾选框。
+   v0.8.1 方框恒为透明底+墨色边框，状态只由框内符号形状区分（不再换底色）。 */
+.st {
   flex: none;
-  width: 14px;
-  height: 14px;
-  margin-top: 3px;
+  width: 15px;
+  height: calc(13px * 1.55 * var(--fs-scale));
+  display: flex;
+  align-items: center;
   border: none;
   background: none;
-  display: grid;
-  place-items: center;
+  padding: 0;
   cursor: pointer;
 }
-.cbx-mark {
-  width: 14px;
-  height: 14px;
+.st-mark {
+  width: 15px;
+  height: 15px;
   border: 1.5px solid var(--ink);
   border-radius: 0;
   background: none;
   display: grid;
   place-items: center;
-  font-size: 10px;
+  font-family: var(--mono);
+  font-size: 9px;
   font-weight: 700;
+  line-height: 1;
+  color: var(--ink);
+  transition: background-color 0.12s ease;
+}
+.st:not([aria-disabled="true"]):hover .st-mark { background: var(--wash); }
+.st[aria-disabled="true"] { cursor: default; }
+.item.todo .st-mark,
+.item.done .st-mark { color: var(--ink-3); opacity: 0.5; font-size: 10px; }
+
+/* 行尾完成勾选框（常显）：勾=完成冻结、取消=复活续计；完成不进单击循环。 */
+.cbx {
+  flex: none;
+  width: 20px;
+  height: calc(13px * 1.55 * var(--fs-scale));
+  display: flex;
+  align-items: center;
+  border: none;
+  background: none;
+  padding: 0;
+  cursor: pointer;
+}
+.cbx-mark {
+  width: 15px;
+  height: 15px;
+  border: 1.5px solid var(--ink);
+  border-radius: 0;
+  background: none;
+  display: grid;
+  place-items: center;
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
   color: transparent;
   cursor: pointer;
 }
-.cbx:hover .cbx-mark { background: rgba(22, 24, 26, 0.12); }
-.item.done .cbx-mark { background: var(--ink); color: var(--panel); }
+.cbx:hover .cbx-mark { background: var(--wash); }
+.item.done .cbx-mark { color: var(--ink); }
 
 .body { flex: 1; min-width: 0; }
+/* 标题行：正文占位 + 计时器右对齐黑色正字 */
+.title-line { display: flex; align-items: baseline; gap: 8px; }
+.title-line .txt { flex: 1; min-width: 0; }
 .txt {
-  font-size: 13px;
+  font-size: calc(13px * var(--fs-scale));
   line-height: 1.55;
   word-break: break-word;
   cursor: text;
 }
 .item.done .txt { color: var(--ink-3); text-decoration: line-through; }
+.timer {
+  flex: none;
+  margin-left: auto;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: calc(10.5px * var(--fs-scale));
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+  cursor: default;
+}
+.item.done .timer { color: var(--ink-3); }
 .txt-input {
   width: 100%;
   border: none;
   border-bottom: 1px solid var(--ink);
   background: none;
-  font-size: 13px;
+  font-size: calc(13px * var(--fs-scale));
   font-family: inherit;
   color: var(--ink);
   padding: 0 0 1px;
+  line-height: 1.55;
+  resize: none;
+  overflow: hidden;
 }
 .sub-line {
-  font-size: 11.5px;
+  font-size: calc(11.5px * var(--fs-scale));
   color: var(--ink-2);
   line-height: 1.5;
   margin-top: 4px;
   padding-left: 10px;
   border-left: 1px solid var(--ink-3);
 }
+.item.done .sub-line { color: var(--ink-3); }
 .meta {
   margin-top: 3px;
   display: flex;
@@ -344,8 +405,8 @@ button:focus-visible, input:focus-visible, summary:focus-visible, [tabindex]:foc
   align-items: baseline;
 }
 .tag { font-size: 10.5px; letter-spacing: 0.06em; }
-.doing-tag { color: var(--ink-2); border-bottom: 1px solid var(--ink-2); }
-.overdue-tag, .blocked-tag { color: var(--accent); font-weight: 700; }
+/* v0.8：受阻 UI 整体删除（协议兼容保留），标签样式随之退役。 */
+.overdue-tag { color: var(--accent); font-weight: 700; }
 
 .del {
   flex: none;
@@ -398,14 +459,18 @@ button:focus-visible, input:focus-visible, summary:focus-visible, [tabindex]:foc
 }
 .add:hover { color: var(--ink); }
 .add-open { display: flex; border-top: 2px solid var(--hair); }
+/* v0.8 录入为 textarea：Shift+回车换行，回车保存；高度随内容自动增高。 */
 .add-input {
   flex: 1;
   border: none;
   background: none;
   padding: 10px 12px;
-  font-size: 13px;
+  font-size: calc(13px * var(--fs-scale));
   font-family: inherit;
   color: var(--ink);
+  line-height: 1.55;
+  resize: none;
+  overflow: hidden;
 }
 .add-input::placeholder { color: var(--ink-3); }
 .add-input:focus-visible { background: rgba(22, 24, 26, 0.05); }
@@ -460,16 +525,6 @@ button:focus-visible, input:focus-visible, summary:focus-visible, [tabindex]:foc
   cursor: pointer;
 }
 .ctx-item:hover { background: rgba(22, 24, 26, 0.07); }
-.ctx-input {
-  width: 100%;
-  border: none;
-  border-bottom: 1px solid rgba(22, 24, 26, 0.2);
-  background: none;
-  padding: 7px 12px;
-  font-size: 12px;
-  font-family: inherit;
-  color: var(--ink);
-}
 
 /* ============ 页脚：同步状态 + 笔记本 + 外观 ============ */
 .foot {
@@ -519,6 +574,21 @@ button:focus-visible, input:focus-visible, summary:focus-visible, [tabindex]:foc
 .theme-heading { padding: 9px 12px 7px; color: var(--ink-2); font-size: 11px; }
 #theme-name { float: right; font-weight: 600; }
 .theme-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; padding: 2px 12px 6px; }
+/* v0.8 字号五档（12–16px）：A− / 当前档 / A⁺，边界档禁用对应按钮。 */
+.fontsize-row { display: flex; align-items: center; gap: 8px; padding: 4px 12px 8px; }
+.fontsize-row button {
+  min-width: 40px;
+  height: 26px;
+  border: 1px solid var(--hairline);
+  background: transparent;
+  color: var(--ink-2);
+  font-family: var(--mono);
+  font-size: 12px;
+  cursor: pointer;
+}
+.fontsize-row button:hover:not(:disabled) { background: var(--wash); color: var(--ink); }
+.fontsize-row button:disabled { opacity: 0.4; cursor: default; }
+#font-size-label { flex: 1; text-align: center; font-family: var(--mono); font-size: 11px; color: var(--ink-2); }
 .theme-option { display: flex; align-items: center; gap: 6px; min-height: 40px; padding: 5px; background: transparent; color: var(--ink-2); border: 1px solid var(--hairline); text-align: left; font-size: 10px; cursor: pointer; }
 .theme-option:hover { background: var(--wash); }
 .theme-option[aria-pressed="true"] { border-color: var(--ink); color: var(--ink); font-weight: 700; box-shadow: inset 0 -2px var(--ink); }
@@ -527,43 +597,8 @@ button:focus-visible, input:focus-visible, summary:focus-visible, [tabindex]:foc
 .bar { border: none; background: none; padding: 0; }
 .txt[role="button"] { text-align: left; }
 .stats-bar, .cbx:hover .cbx-mark, .add-input:focus-visible, .ctx-item:hover { background: var(--wash); }
-.carry-row, .ctx-input { border-color: var(--hairline); }
+.carry-row { border-color: var(--hairline); }
 ::-webkit-scrollbar-thumb { background: var(--ink-3); }
-
-:root[data-theme="kraft"] {
-  --panel: #eee0c6; --ink: #513c2c; --ink-2: #685440; --ink-3: #725d48;
-  --hair: #8b6b47; --hairline: #cdbc9e; --accent: #a33322; --link: #325b83; --ok: #386940;
-  --wash: #e4d3b5;
-}
-[data-theme="kraft"] .mast { border-top: 6px solid var(--hair); border-bottom-style: dashed; }
-[data-theme="kraft"] .mast-date #head-date { font-family: Georgia, serif; }
-
-:root[data-theme="cream"] {
-  --panel: #fff9e9; --ink: #544633; --ink-2: #716048; --ink-3: #78674f;
-  --hair: #aa8950; --hairline: #e0d5ba; --accent: #ae3727; --link: #346085; --ok: #426c41;
-  --wash: #f1e8d0;
-  --paper-pattern: repeating-linear-gradient(transparent 0 25px, #c1b18c22 25px 26px);
-}
-[data-theme="cream"] .mast { border-top: 6px solid #d4b976; }
-[data-theme="cream"] .sticky { border-left: 3px solid #c9937d; }
-
-:root[data-theme="sage"] {
-  --panel: #edf2e7; --ink: #304f41; --ink-2: #506354; --ink-3: #5f6f60;
-  --hair: #77947a; --hairline: #c5d2bf; --accent: #ae3c32; --link: #2c6179; --ok: #356a41;
-  --wash: #dfe8d8;
-  --paper-pattern: linear-gradient(#6f8e6c0c 1px, transparent 1px), linear-gradient(90deg, #6f8e6c0c 1px, transparent 1px);
-}
-[data-theme="sage"] .sticky { background-size: 18px 18px; }
-[data-theme="sage"] .mast { border-top: 6px solid #66866c; }
-
-:root[data-theme="rose"] {
-  --panel: #fbefef; --ink: #704653; --ink-2: #795a63; --ink-3: #82616b;
-  --hair: #b58391; --hairline: #e4cbd1; --accent: #ae302e; --link: #535999; --ok: #426f55;
-  --wash: #f1dfe3;
-}
-[data-theme="rose"] .sticky { border-left: 5px double var(--hair); }
-[data-theme="rose"] .mast { border-top: 6px solid #c699a6; }
-[data-theme="rose"] .mast-date #head-date { font-family: Georgia, serif; }
 
 :root[data-theme="midnight"] {
   color-scheme: dark;
@@ -643,21 +678,24 @@ button:focus-visible, input:focus-visible, summary:focus-visible, [tabindex]:foc
   .footer-area .foot { padding-right: 34px; }
   #head-today, #notes-toggle { display: none; }
   .add, .add-open { border-top: 1px solid var(--hairline); }
+  /* v0.8 桌面删除入口改右键菜单「删除这条任务」，行内 ✕ 只保留给触摸端。 */
+  .del { display: none; }
   #note-square { display: block; position: relative; width: auto; height: 180px; margin: 10px 0; }
-  #note-square textarea { box-sizing: border-box; display: block; width: 100%; height: 100%; resize: none; overflow: auto; padding: 10px 10px 28px; border: 1px solid var(--hairline); background: var(--wash); color: var(--ink); font: inherit; line-height: 1.5; }
+  #note-square textarea { box-sizing: border-box; display: block; width: 100%; height: 100%; resize: none; overflow: auto; padding: 10px 10px 28px; border: 1px solid var(--hairline); background: var(--wash); color: var(--ink); font: inherit; font-size: calc(13px * var(--fs-scale)); line-height: 1.5; }
   #note-square textarea::placeholder { color: var(--ink-3); opacity: .7; }
   #note-square textarea:focus { outline: 1px solid var(--ink-2); outline-offset: -1px; background: var(--panel); }
   #note-square-status { position: absolute; bottom: 4px; left: 10px; right: 10px; font-size: 10px; color: var(--ink-3); background: var(--panel); max-height: 30px; overflow: auto; }
 }
 
 @media (hover: none) {
+  .bar { min-width: 20px; }
   button, summary, .txt[role="button"] {
     transition: filter 100ms ease, background-color 100ms ease;
   }
   button:enabled:active, summary:active { filter: brightness(.96); }
   .notebook-option:enabled:active, .ctx-item:active, .txt[role="button"]:active { background: var(--wash); }
-  .add-fab:enabled:active, .cbx:enabled:active { filter: brightness(.92); }
-  .cbx { min-width: 44px; min-height: 44px; }
+  .add-fab:enabled:active, .cbx:enabled:active, .st:enabled:active { filter: brightness(.92); }
+  .cbx, .st { min-width: 44px; min-height: 44px; }
   /* 回今天：紧凑圆钮，覆盖粗指针通用的 44px 最小尺寸。 */
   .today-chip {
     width: 38px;

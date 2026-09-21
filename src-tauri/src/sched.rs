@@ -165,38 +165,6 @@ pub(crate) fn sync_error_message(error: &SyncError) -> String {
     format!("同步失败: {}", sanitize_sync_error(&error.to_string(), pat.as_deref()))
 }
 
-#[cfg(test)]
-mod error_message_tests {
-    use super::sanitize_sync_error;
-
-    #[test]
-    fn sanitize_sync_error_preserves_safe_messages_and_is_idempotent() {
-        for message in ["", "certificate verify failed", "网络失败，PAT 权限不足"] {
-            assert_eq!(sanitize_sync_error(message, Some("")), message);
-            assert_eq!(sanitize_sync_error(&sanitize_sync_error(message, None), None), message);
-        }
-        let clean = sanitize_sync_error(&"证".repeat(250), None);
-        assert_eq!(clean.chars().count(), 200);
-        assert_eq!(sanitize_sync_error(&clean, None), clean);
-    }
-
-    #[test]
-    fn sanitize_sync_error_removes_credentials_before_truncation() {
-        let message = "TLS https://alice:secret@example.com/repo HTTPS://bob:pass@example.org/repo \
-            ghp_fragment github_pat_fragment token=opaque PAT: 'private' \
-            Authorization: Bearer bearer-secret stored-secret";
-        let clean = sanitize_sync_error(message, Some("stored-secret"));
-        for secret in ["alice", "secret", "bob", "pass@", "fragment", "opaque", "private"] {
-            assert!(!clean.contains(secret), "leaked {secret}: {clean}");
-        }
-        assert!(clean.contains("https://example.com/repo"));
-        assert_eq!(sanitize_sync_error(&clean, Some("stored-secret")), clean);
-        let long_url = format!("https://user:{}@example.com TLS failed", "x".repeat(250));
-        assert_eq!(sanitize_sync_error(&long_url, None), "https://example.com TLS failed");
-        assert_eq!(sanitize_sync_error("Authorization: Bearer opaque", None), "Authorization: [redacted] [redacted]");
-    }
-}
-
 /// 启动时确保仓库可用。失败 → Error 状态 + 按 retry 重试。
 fn ensure_repo(store: &StickyStore, retry_at: &mut Option<Instant>, timing: &SchedTiming, emit: &EmitFn, url: &str) -> bool {
     // 克隆全程持 io 锁：命令层的读-改-写不与 checkout 交叠（.git 中途就会出现，
@@ -338,7 +306,7 @@ fn rollover_rescan(store: &Arc<StickyStore>, emit: &EmitFn) {
 
 fn commit_message(pending: usize) -> String {
     let d = today().format("%Y-%m-%d");
-    // 形如 `sticky@office: 2026-09-10 add 3 / done 2 (day, week)`——汇总为编辑计数
+    // PRD 形如 `sticky@office: 2026-09-10 add 3 / done 2 (day, week)`——v1 汇总为编辑计数
     format!("{} {d} {pending} edits", commit_prefix())
 }
 
@@ -417,5 +385,37 @@ fn silent_pull(store: &Arc<StickyStore>, retry_at: &mut Option<Instant>, emit: &
         if let Ok(p) = serde_json::to_string(&after) {
             emit("view-changed", &p);
         }
+    }
+}
+
+#[cfg(test)]
+mod error_message_tests {
+    use super::sanitize_sync_error;
+
+    #[test]
+    fn sanitize_sync_error_preserves_safe_messages_and_is_idempotent() {
+        for message in ["", "certificate verify failed", "网络失败，PAT 权限不足"] {
+            assert_eq!(sanitize_sync_error(message, Some("")), message);
+            assert_eq!(sanitize_sync_error(&sanitize_sync_error(message, None), None), message);
+        }
+        let clean = sanitize_sync_error(&"证".repeat(250), None);
+        assert_eq!(clean.chars().count(), 200);
+        assert_eq!(sanitize_sync_error(&clean, None), clean);
+    }
+
+    #[test]
+    fn sanitize_sync_error_removes_credentials_before_truncation() {
+        let message = "TLS https://alice:secret@example.com/repo HTTPS://bob:pass@example.org/repo \
+            ghp_fragment github_pat_fragment token=opaque PAT: 'private' \
+            Authorization: Bearer bearer-secret stored-secret";
+        let clean = sanitize_sync_error(message, Some("stored-secret"));
+        for secret in ["alice", "secret", "bob", "pass@", "fragment", "opaque", "private"] {
+            assert!(!clean.contains(secret), "leaked {secret}: {clean}");
+        }
+        assert!(clean.contains("https://example.com/repo"));
+        assert_eq!(sanitize_sync_error(&clean, Some("stored-secret")), clean);
+        let long_url = format!("https://user:{}@example.com TLS failed", "x".repeat(250));
+        assert_eq!(sanitize_sync_error(&long_url, None), "https://example.com TLS failed");
+        assert_eq!(sanitize_sync_error("Authorization: Bearer opaque", None), "Authorization: [redacted] [redacted]");
     }
 }

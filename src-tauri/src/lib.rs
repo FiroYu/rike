@@ -3,8 +3,8 @@
 //! 命令分组：
 //! - 视图：get_view / get_yesterday_leftovers / sync_status
 //! - 编辑（全部带 base_version 防陈旧写）：set_checked / set_category / set_priority /
-//!   set_flag / set_blocked / set_content / delete_task / restore_deleted / add_task /
-//!   copy_leftover_to_today
+//!   set_flag / set_status（v0.8 状态机）/ set_blocked / set_content（v0.8 可带子行）/
+//!   delete_task / restore_deleted / add_task（v0.8 可带子行）/ copy_leftover_to_today
 //! - 同步：sync_now（手动 F20）
 //!
 //! 后台调度线程（sched.rs）负责首运行克隆、30min tick（脏→自动保存 / 干净→静默
@@ -202,17 +202,38 @@ fn set_flag(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn set_content(
     notebook_id: String,
     kind: String,
     date: Option<String>,
     line_idx: usize,
     content: String,
+    // v0.8 多行编辑：null=保留旧子行 / []=清空 / 非空=整体替换（两空格结构缩进落盘）
+    sub_lines: Option<Vec<String>>,
     base_version: String,
     state: tauri::State<StoreState>,
 ) -> Result<store::EditResult, CmdError> {
     parser::validate_user_text(&content).map_err(CmdError::bad_request)?;
-    state.set_content(&notebook_id, &view_kind(&kind, date.as_deref())?, line_idx, &content, parse_bv(&base_version)?)
+    if let Some(subs) = sub_lines.as_deref() {
+        parser::validate_sub_lines(subs).map_err(CmdError::bad_request)?;
+    }
+    state.set_content(&notebook_id, &view_kind(&kind, date.as_deref())?, line_idx, &content, sub_lines, parse_bv(&base_version)?)
+}
+
+/// v0.8 状态机：target ∈ doing|paused|done（todo 拒绝——一次性初始态）。
+#[tauri::command]
+fn set_status(
+    notebook_id: String,
+    kind: String,
+    date: Option<String>,
+    line_idx: usize,
+    target: String,
+    base_version: String,
+    state: tauri::State<StoreState>,
+) -> Result<store::EditResult, CmdError> {
+    let target = store::parse_status(&target)?;
+    state.set_task_status(&notebook_id, &view_kind(&kind, date.as_deref())?, line_idx, target, parse_bv(&base_version)?)
 }
 
 #[tauri::command]
@@ -259,7 +280,7 @@ fn set_blocked(
     state.set_blocked(&notebook_id, &view_kind(&kind, date.as_deref())?, line_idx, reason.as_deref(), parse_bv(&base_version)?)
 }
 
-/// 新任务默认 P1（PRD G4）；分类缺省 = 未分类。
+/// 新任务默认 P1（PRD G4）；分类缺省 = 未分类；可选子行（v0.8 多行录入）。
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 fn add_task(
@@ -269,6 +290,7 @@ fn add_task(
     category: Option<String>,
     priority: Option<String>,
     text: String,
+    sub_lines: Option<Vec<String>>,
     base_version: String,
     state: tauri::State<StoreState>,
 ) -> Result<store::AddResult, CmdError> {
@@ -276,7 +298,9 @@ fn add_task(
         .unwrap_or(parser::Category::Uncategorized);
     let prio = store::parse_priority(priority.as_deref())?.unwrap_or(parser::Priority::P1);
     parser::validate_user_text(&text).map_err(CmdError::bad_request)?;
-    state.add_task(&notebook_id, &view_kind(&kind, date.as_deref())?, cat, prio, &text, parse_bv(&base_version)?)
+    let subs = sub_lines.unwrap_or_default();
+    parser::validate_sub_lines(&subs).map_err(CmdError::bad_request)?;
+    state.add_task(&notebook_id, &view_kind(&kind, date.as_deref())?, cat, prio, &text, &subs, parse_bv(&base_version)?)
 }
 
 #[tauri::command]
@@ -380,6 +404,7 @@ pub fn run() {
             set_category,
             set_priority,
             set_flag,
+            set_status,
             set_content,
             delete_task,
             restore_deleted,

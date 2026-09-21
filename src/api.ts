@@ -3,6 +3,8 @@
 export type Priority = "P0" | "P1" | "P2" | "P3";
 export type Category = "Work" | "Personal" | "Uncategorized";
 export type ViewKind = "day" | "week";
+/** serde(rename_all = "lowercase") 的 TaskStatus：待开始一次性初始态，永不回归 */
+export type TaskStatus = "todo" | "doing" | "paused" | "done";
 
 export interface NoteDayDto { date: string; weekday: string; content: string; base_version: string }
 export interface NotesDto { kind: ViewKind; date: string; days: NoteDayDto[] }
@@ -24,6 +26,14 @@ export interface TaskView {
   doing: boolean;
   overdue: boolean;
   blocked_reason: string | null;
+  /** v0.8 四态派生（checked > #paused > #doing > 仅 t/ts > todo） */
+  status: TaskStatus;
+  /** 已结算累计秒（含 Doing 态的进行中增量由前端 ticker 现算） */
+  timer_secs: number;
+  /** Doing 态的起点 Unix 秒；非 Doing 或无 #ts 时为 null */
+  timer_started_at: number | null;
+  /** 行内存在非法 #t token（值取最后合法值，标签由下次状态手术清理） */
+  timer_invalid: boolean;
   sub_lines: string[];
   section: string;
   subsection: string | null;
@@ -112,22 +122,6 @@ export const api = {
       lineIdx,
       baseVersion,
     }),
-  setChecked: (
-    notebookId: string,
-    kind: ViewKind,
-    lineIdx: number,
-    checked: boolean,
-    baseVersion: string,
-    date?: string | null,
-  ) => call<{ base_version: string }>("set_checked", { notebookId, kind, lineIdx, checked, baseVersion, date }),
-  setCategory: (
-    notebookId: string,
-    kind: ViewKind,
-    lineIdx: number,
-    category: string | null,
-    baseVersion: string,
-    date?: string | null,
-  ) => call<{ base_version: string }>("set_category", { notebookId, kind, lineIdx, category, baseVersion, date }),
   setPriority: (
     notebookId: string,
     kind: ViewKind,
@@ -143,24 +137,19 @@ export const api = {
     content: string,
     baseVersion: string,
     date?: string | null,
-  ) => call<{ base_version: string }>("set_content", { notebookId, kind, lineIdx, content, baseVersion, date }),
-  setFlag: (
+    /** v0.8 多行：不传=保留旧子行 / []=清空 / 非空=整体替换（undefined 键不序列化 → None） */
+    subLines?: string[],
+  ) =>
+    call<{ base_version: string }>("set_content", { notebookId, kind, lineIdx, content, baseVersion, date, subLines }),
+  setStatus: (
     notebookId: string,
     kind: ViewKind,
     lineIdx: number,
-    flag: string,
-    on: boolean,
+    /** "todo" 后端拒绝（待开始不可回归）；done=完成冻结、doing=复活续计 */
+    target: "doing" | "paused" | "done",
     baseVersion: string,
     date?: string | null,
-  ) => call<{ base_version: string }>("set_flag", { notebookId, kind, lineIdx, flag, on, baseVersion, date }),
-  setBlocked: (
-    notebookId: string,
-    kind: ViewKind,
-    lineIdx: number,
-    reason: string | null,
-    baseVersion: string,
-    date?: string | null,
-  ) => call<{ base_version: string }>("set_blocked", { notebookId, kind, lineIdx, reason, baseVersion, date }),
+  ) => call<{ base_version: string }>("set_status", { notebookId, kind, lineIdx, target, baseVersion, date }),
   deleteTask: (
     notebookId: string,
     kind: ViewKind,
@@ -184,6 +173,8 @@ export const api = {
     text: string,
     baseVersion: string,
     date?: string | null,
+    /** v0.8 多行录入：不传/空数组=无子行 */
+    subLines?: string[],
   ) =>
     call<{ base_version: string; line_idx: number }>("add_task", {
       notebookId,
@@ -193,6 +184,7 @@ export const api = {
       text,
       baseVersion,
       date,
+      subLines,
     }),
   syncNow: () => call<null>("sync_now"),
   getSyncConfig: () => call<{ repo_url: string; pat_set: boolean }>("get_sync_config"),

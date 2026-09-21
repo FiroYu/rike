@@ -231,10 +231,10 @@ fn future_tasks_stay_until_due_then_roll_over() {
     assert!(!a.join("days/2027-01-01.md").exists(), "浏览不建文件");
 
     // 2) 真实 add_task 在 T 预排两项，完成其一；U 预排一项
-    let r1 = store.add_task("default", &t_kind, Category::Uncategorized, Priority::P1, "预排任务甲", 0).unwrap();
-    let r2 = store.add_task("default", &t_kind, Category::Uncategorized, Priority::P1, "预排任务乙", r1.base_version).unwrap();
+    let r1 = store.add_task("default", &t_kind, Category::Uncategorized, Priority::P1, "预排任务甲", &[], 0).unwrap();
+    let r2 = store.add_task("default", &t_kind, Category::Uncategorized, Priority::P1, "预排任务乙", &[], r1.base_version).unwrap();
     store.set_checked("default", &t_kind, r2.line_idx, true, r2.base_version).unwrap();
-    store.add_task("default", &u_kind, Category::Uncategorized, Priority::P1, "U日原有任务", 0).unwrap();
+    store.add_task("default", &u_kind, Category::Uncategorized, Priority::P1, "U日原有任务", &[], 0).unwrap();
     let t_before = read(&a, "days/2027-01-01.md");
     let u_before = read(&a, "days/2027-01-02.md");
     assert!(t_before.starts_with("# 2027-01-01"), "未来文件套当日模板: {t_before}");
@@ -260,4 +260,73 @@ fn future_tasks_stay_until_due_then_roll_over() {
     // 5) 幂等重入
     let again = carry_over(&store, d("2027-01-02")).unwrap();
     assert_eq!((again.moved, again.merged), (0, 0));
+}
+
+// ---------- v0.8：同任务判定升级（计时/暂停/子行等富信息保护） ----------
+
+/// 同文但今日侧带计时（富）→ 不是同一任务：两份保留，不静默丢源数据。
+#[test]
+fn v08_same_content_rich_tasks_both_kept() {
+    let a = setup_repo("v08-rich");
+    write(&a, "days/2026-09-16.md", &day_file(&["- [ ] 任务A #t 100 #paused"]));
+    write(&a, "days/2026-09-15.md", &day_file(&["- [ ] 任务A"]));
+    let store = StickyStore::new(a.clone());
+    let report = carry_over(&store, d("2026-09-16")).unwrap();
+    assert_eq!((report.moved, report.merged), (1, 0), "同文但今日带计时：不并入");
+    let today = read(&a, "days/2026-09-16.md");
+    assert_eq!(today.matches("- [ ] 任务A").count(), 2, "两份都保留: {today}");
+    assert!(today.contains("#t 100 #paused"), "今日原任务计时不受影响");
+    assert!(!read(&a, "days/2026-09-15.md").contains("- [ ]"), "源清空");
+}
+
+/// 剥 #overdue 后整块字节相等（含计时）→ 并入。
+#[test]
+fn v08_identical_rich_blocks_merge() {
+    let a = setup_repo("v08-merge-rich");
+    write(&a, "days/2026-09-16.md", &day_file(&["- [ ] 任务A #t 100 #paused"]));
+    // 昨日同任务但带 #overdue（旧日期状态剥掉后与今日整块相等）
+    write(&a, "days/2026-09-15.md", &day_file(&["- [ ] 任务A #t 100 #paused #overdue"]));
+    let store = StickyStore::new(a.clone());
+    let report = carry_over(&store, d("2026-09-16")).unwrap();
+    assert_eq!((report.moved, report.merged), (0, 1), "整块相等并入");
+    let today = read(&a, "days/2026-09-16.md");
+    assert_eq!(today.matches("- [ ] 任务A").count(), 1, "仍一份: {today}");
+    assert!(!today.contains("#overdue"), "目的不继承旧日期状态");
+}
+
+/// 子行不同 → 两份保留；无同文的照常搬入。
+#[test]
+fn v08_sub_lines_difference_decides() {
+    let a = setup_repo("v08-subs");
+    write(&a, "days/2026-09-16.md", &day_file(&["- [ ] 任务A", "  备注-今日"]));
+    write(&a, "days/2026-09-15.md", &day_file(&[
+        "- [ ] 任务A",
+        "  备注-昨日",
+        "- [ ] 任务B",
+        "  共同备注",
+    ]));
+    let store = StickyStore::new(a.clone());
+    let report = carry_over(&store, d("2026-09-16")).unwrap();
+    assert_eq!((report.moved, report.merged), (2, 0), "A 子行不同两份保留；B 搬入");
+    let today = read(&a, "days/2026-09-16.md");
+    assert!(today.contains("备注-今日") && today.contains("备注-昨日"), "两份共存: {today}");
+    assert!(today.contains("共同备注"), "B 的子行随搬");
+
+    // 幂等重入（源已清空）
+    let again = carry_over(&store, d("2026-09-16")).unwrap();
+    assert_eq!((again.moved, again.merged), (0, 0));
+}
+
+/// 双方朴素同文（仅优先级不同）→ 仍并入（v0.7 内容级语义保留给朴素任务，今日版胜出）。
+#[test]
+fn v08_plain_tasks_still_merge_on_content() {
+    let a = setup_repo("v08-plain");
+    write(&a, "days/2026-09-16.md", &day_file(&["- [ ] (P2) 任务A"]));
+    write(&a, "days/2026-09-15.md", &day_file(&["- [ ] (P1) 任务A"]));
+    let store = StickyStore::new(a.clone());
+    let report = carry_over(&store, d("2026-09-16")).unwrap();
+    assert_eq!((report.moved, report.merged), (0, 1), "朴素同文并入");
+    let today = read(&a, "days/2026-09-16.md");
+    assert_eq!(today.matches("- [ ]").count(), 1, "仍一份: {today}");
+    assert!(today.contains("(P2)"), "今日版本胜出: {today}");
 }

@@ -1,6 +1,6 @@
 /** 纯渲染：状态 → DOM。无副作用、无 invoke；交互由 main.ts 事件委托处理。 */
 
-import type { Category, LeftoversDto, Notebook, NotesDto, SyncState, TaskView, ViewKind } from "./api";
+import type { Category, LeftoversDto, Notebook, NotesDto, SyncState, TaskStatus, TaskView, ViewKind } from "./api";
 
 const WEEKDAY_CN = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
 export const TOUCH_DEVICE = window.matchMedia('(hover: none)').matches;
@@ -8,13 +8,15 @@ export const TOUCH_DEVICE = window.matchMedia('(hover: none)').matches;
 export function renderSyncSettings(panel: HTMLElement): void {
   const settings = document.createElement("div");
   settings.className = "sync-settings";
+  const patHidden = !/android/i.test(navigator.userAgent) ? "hidden" : "";
   settings.innerHTML = `
     <button id="sync-settings-toggle" class="notebook-option" type="button" aria-expanded="false" aria-controls="sync-settings-form">同步设置</button>
     <form id="sync-settings-form" hidden>
       <label for="sync-repo-url">同步仓库</label>
       <input id="sync-repo-url" type="text" readonly aria-readonly="true">
-      <label for="sync-pat">PAT <span id="sync-pat-set" hidden>已设置</span></label>
-      <input id="sync-pat" type="password" placeholder="GitHub Fine-grained PAT" autocomplete="new-password" spellcheck="false" autocapitalize="off">
+      <label for="sync-pat" ${patHidden}>PAT <span id="sync-pat-set" hidden>已设置</span></label>
+      <input ${patHidden} id="sync-pat" type="password" placeholder="GitHub Fine-grained PAT" autocomplete="new-password" spellcheck="false" autocapitalize="off">
+      <p ${patHidden}>同步令牌仅安卓端需要</p>
       <div class="sync-settings-actions"><button type="submit">保存</button><button id="sync-test" type="button">测试连接</button></div>
       <p id="sync-settings-status" role="status" aria-live="polite"></p>
     </form>`;
@@ -31,6 +33,36 @@ const CATEGORY_ORDER: Category[] = ["Work", "Personal", "Uncategorized"];
 
 /** 优先级样式档（原型 B：mono 文本，P0 红）。 */
 const PRIO_CLASS: Record<string, string> = { P0: "p0", P1: "p1", P2: "p2", P3: "p3" };
+// 显示序键：优先级 P0→P3→无；无优先级排最后（rank=4）。
+const PRIORITY_RANK: Record<string, number> = { P0: 0, P1: 1, P2: 2, P3: 3 };
+
+/** v0.8 状态四态文案与符号（与 Rust TIMER_CAP_SECS 同值的展示上限）。 */
+export const TIMER_CAP_SECS = 359999;
+const STATUS_LABEL: Record<TaskStatus, string> = { todo: "待开始", doing: "进行中", paused: "暂停", done: "完成" };
+const ST_SYMBOL: Record<TaskStatus, string> = { todo: "○", doing: "▶", paused: "‖", done: "○" };
+const ST_TITLE: Record<TaskStatus, string> = {
+  todo: "点击开始（→ 进行中）",
+  doing: "点击暂停",
+  paused: "点击继续",
+  done: "完成（取消行尾勾选复活，回暂停）",
+};
+
+/** 计时显示值 = 已结算累计 + 进行中增量（时钟倒拨取 0），封顶 99:59:59。 */
+export function timerDisplaySecs(task: TaskView, nowMs: number): number {
+  const delta = task.status === "doing" && task.timer_started_at !== null
+    ? Math.max(0, Math.floor(nowMs / 1000) - task.timer_started_at)
+    : 0;
+  return Math.min(task.timer_secs + delta, TIMER_CAP_SECS);
+}
+
+/** 固定八位 HH:MM:SS 等宽展示。 */
+export function formatHms(totalSecs: number): string {
+  const s = Math.min(Math.max(Math.trunc(totalSecs), 0), TIMER_CAP_SECS);
+  const h = String(Math.floor(s / 3600)).padStart(2, "0");
+  const m = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
+  const x = String(s % 60).padStart(2, "0");
+  return `${h}:${m}:${x}`;
+}
 
 export interface FoldState {
   folded: Set<Category>;
@@ -102,7 +134,7 @@ export function renderNotes(body: HTMLElement, dto: NotesDto): void {
 }
 
 function renderTask(task: TaskView, showSource: boolean): HTMLElement {
-  const item = el("div", "item" + (task.checked ? " done" : ""));
+  const item = el("div", `item ${task.status}`);
   item.dataset.line = String(task.row_idx);
 
   const prio = task.priority ? PRIO_CLASS[task.priority] : "pnone";
@@ -112,17 +144,19 @@ function renderTask(task: TaskView, showSource: boolean): HTMLElement {
   bar.setAttribute("aria-label", `切换优先级：${task.priority ?? "未设置"}`);
   item.append(bar);
 
-  const cbx = el("button", "cbx");
-  const mark = el("span", "cbx-mark", task.checked ? "✓" : "");
-  mark.setAttribute("aria-hidden", "true");
-  cbx.append(mark);
-  cbx.dataset.action = "check";
-  cbx.setAttribute("role", "checkbox");
-  cbx.setAttribute("aria-checked", String(task.checked));
-  cbx.setAttribute("aria-label", task.display);
-  item.append(cbx);
+  // 左侧状态钮（v0.8 四态合一）：单击循环只在进行中⇄暂停；完成态禁点（复活走行尾勾选框）。
+  const st = el("button", "st");
+  const stMark = el("span", "st-mark", ST_SYMBOL[task.status]);
+  stMark.setAttribute("aria-hidden", "true");
+  st.append(stMark);
+  st.dataset.action = "status";
+  st.title = ST_TITLE[task.status];
+  st.setAttribute("aria-label", `状态：${STATUS_LABEL[task.status]}`);
+  if (task.status === "done") st.setAttribute("aria-disabled", "true");
+  item.append(st);
 
   const body = el("div", "body");
+  const line = el("div", "title-line");
   const txt = el("div", "txt");
   txt.textContent = task.display; // 全文自适应，不折叠
   txt.dataset.action = "edit";
@@ -137,25 +171,41 @@ function renderTask(task: TaskView, showSource: boolean): HTMLElement {
       }
     });
   }
-  body.append(txt);
+  line.append(txt);
+  // 待开始不显示计时；一旦离开初始态 00:00:00 也显示（离开即落 #t 0）。
+  if (task.status !== "todo") {
+    const tm = el("span", "timer", formatHms(timerDisplaySecs(task, Date.now())));
+    tm.dataset.timerLine = String(task.row_idx);
+    line.append(tm);
+  }
+  body.append(line);
 
+  // 子行统一容器：编辑时整体隐藏，避免 textarea 与旧子行重复显示。
   if (task.sub_lines.length > 0) {
-    for (const s of task.sub_lines) {
-      body.append(el("div", "sub-line", s));
-    }
+    const subs = el("div", "subs");
+    for (const s of task.sub_lines) subs.append(el("div", "sub-line", s));
+    body.append(subs);
   }
 
   const meta = el("div", "meta");
   if (task.source.kind === "day" && showSource) {
     meta.append(el("span", "source-date", `${mmdd(task.source.date)} ${weekdayCn(task.source.date)}`));
   }
-  if (task.doing) meta.append(el("span", "tag doing-tag", "进行中"));
   if (task.overdue) meta.append(el("span", "tag overdue-tag", "逾期"));
-  if (task.blocked_reason) {
-    meta.append(el("span", "tag blocked-tag", `受阻: ${task.blocked_reason}`));
-  }
   if (meta.childElementCount > 0) body.append(meta);
   item.append(body);
+
+  // 行尾完成勾选框（常显）：勾=完成冻结、取消=恢复为暂停，累计冻结不清零，点状态钮续计。
+  const cbx = el("button", "cbx");
+  const mark = el("span", "cbx-mark", "✓");
+  mark.setAttribute("aria-hidden", "true");
+  cbx.append(mark);
+  cbx.dataset.action = "check";
+  cbx.setAttribute("role", "checkbox");
+  cbx.setAttribute("aria-checked", String(task.checked));
+  cbx.setAttribute("aria-label", task.checked ? "取消完成并恢复为暂停" : "完成任务");
+  cbx.title = task.checked ? "取消勾选：恢复为暂停，累计计时冻结不清零；点状态钮继续计时" : "勾选完成（计时冻结）";
+  item.append(cbx);
 
   const del = el("button", "del");
   del.textContent = "✕";
@@ -166,7 +216,48 @@ function renderTask(task: TaskView, showSource: boolean): HTMLElement {
   return item;
 }
 
+function compareTasks(a: TaskView, b: TaskView): number {
+  return Number(a.checked) - Number(b.checked)
+    || ((a.priority === null ? 4 : PRIORITY_RANK[a.priority])
+      - (b.priority === null ? 4 : PRIORITY_RANK[b.priority]));
+}
+
+// —— 优先级调档期间的排序冻结 ——
+// 连点优先级钮换档时，逐次重排会让目标行每点一次跳一次位、难以继续点击。
+// 首次调整时锁定当时的显示序（main.ts holdSortResort 传入），冻结期间渲染
+// 沿用锁定序、条目原地换档；停止调整 1.5 秒后解锁并重排一次（时长在 main.ts）。
+// 仅影响显示序：文件序、行号引用、同步均不受影响。
+let frozenOrder: Map<string, number> | null = null;
+
+/** 跨日/跨视图稳定的任务身份键（与 focusTaskControl 的定位三元组一致）。 */
+export function taskKey(t: TaskView): string {
+  return `${t.source.kind}:${t.source.date}:${t.line_idx}`;
+}
+
+export function holdSortOrder(keys: string[]): void {
+  frozenOrder = new Map(keys.map((k, i) => [k, i]));
+}
+
+export function releaseSortOrder(): void {
+  frozenOrder = null;
+}
+
+/** 冻结期按锁定序排（不在锁定内的行视为新增，按常规序排在其后）；否则按常规序排。 */
+function orderTasks(tasks: TaskView[]): TaskView[] {
+  const rank = frozenOrder;
+  if (rank === null) return [...tasks].sort(compareTasks);
+  const frozen: TaskView[] = [];
+  const fresh: TaskView[] = [];
+  for (const t of tasks) (rank.has(taskKey(t)) ? frozen : fresh).push(t);
+  frozen.sort((a, b) => rank.get(taskKey(a))! - rank.get(taskKey(b))!);
+  return [...frozen, ...fresh.sort(compareTasks)];
+}
+
 function renderGroup(cat: Category, tasks: TaskView[], folded: boolean, showSource: boolean): HTMLElement {
+  // 显示序≠文件序：完成项全局沉底，两段内部按优先级排序，同段同级保留文件原序
+  // （Array.prototype.sort 稳定）。副本排序，不改任务对象与行号引用、不改落盘顺序。
+  // 优先级调档冻结期沿用锁定序（见 orderTasks）。
+  const ordered = orderTasks(tasks);
   const group = el("section", "group");
   group.dataset.cat = cat;
 
@@ -181,8 +272,6 @@ function renderGroup(cat: Category, tasks: TaskView[], folded: boolean, showSour
 
   if (!folded) {
     const list = el("div", "list");
-    // 未完成在前，完成后划线沉底（同组内稳定排序）
-    const ordered = [...tasks.filter((t) => !t.checked), ...tasks.filter((t) => t.checked)];
     for (const t of ordered) list.append(renderTask(t, showSource));
     group.append(list);
   }
@@ -193,7 +282,10 @@ function renderStar(tasks: TaskView[], showSource: boolean): HTMLElement {
   const sec = el("section", "star-sec");
   sec.append(el("div", "star-title", "⭐ 睡前必须完成"));
   const list = el("div", "list");
-  for (const t of tasks) list.append(renderTask(t, showSource));
+  // 与 renderGroup 同序：完成项全局沉底，两段内部按优先级排序，同段同级保留文件原序；
+  // 调档冻结期同走 orderTasks 锁定序。
+  const ordered = orderTasks(tasks);
+  for (const t of ordered) list.append(renderTask(t, showSource));
   sec.append(list);
   return sec;
 }

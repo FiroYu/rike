@@ -483,6 +483,11 @@ impl StickyStore {
         let mut file = TodoFile::parse(&text);
         f(&mut file).map_err(CmdError::bad_request)?;
         let out = file.serialize();
+        // 空操作短路（v0.8）：闭包幂等成功但字节无变化（如同态 set_status、
+        // 重复 remove_flag）时不写盘、不计 pending，版本原样返回。
+        if !created_now && out == text {
+            return Ok(base_version);
+        }
         let path = kind.abs_path(&notebook::root(self.engine.repo_dir(), notebook)?);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -493,6 +498,32 @@ impl StickyStore {
         Ok(hash_text(&out))
     }
 
+    /// 服务端时钟：一次状态手术只读一次（手术内结算与写 ts 用同一值）。
+    fn unix_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// v0.8 状态机入口：target ∈ doing|paused|done（todo 由 parse_status 拒绝）。
+    /// 结算/续计/复活的字节手术全部在 parser::set_status_at 内完成。
+    pub fn set_task_status(
+        &self, notebook: &str,
+        kind: &FileKind,
+        line_idx: usize,
+        target: crate::parser::TaskStatus,
+        base_version: u64,
+    ) -> Result<EditResult, CmdError> {
+        let now = Self::unix_now();
+        let bv = self.edit(notebook, kind, base_version, move |f| {
+            f.set_status_at(line_idx, target, now)
+        })?;
+        Ok(EditResult { base_version: bv })
+    }
+
+    /// 旧勾选命令的 v0.8.1 适配：勾 = set_status(done)（Doing 结算冻结）；
+    /// 取消勾选且当前 Done = set_status(paused)，保留冻结计时；其余（非 Done 取消勾选）无操作。
     pub fn set_checked(
         &self, notebook: &str,
         kind: &FileKind,
@@ -500,13 +531,16 @@ impl StickyStore {
         checked: bool,
         base_version: u64,
     ) -> Result<EditResult, CmdError> {
-        let bv = self.edit(notebook, kind, base_version, |f| {
-            f.set_checked(line_idx, checked)?;
-            // 完成即不再「进行中」（remove_flag 对缺位幂等）
-            if checked {
-                f.remove_flag(line_idx, crate::parser::Flag::Doing)?;
+        let now = Self::unix_now();
+        let bv = self.edit(notebook, kind, base_version, move |f| {
+            let cur = f.status_at(line_idx)?;
+            match (checked, cur) {
+                (true, _) => f.set_status_at(line_idx, crate::parser::TaskStatus::Done, now),
+                (false, crate::parser::TaskStatus::Done) => {
+                    f.set_status_at(line_idx, crate::parser::TaskStatus::Paused, now)
+                }
+                (false, _) => Ok(()),
             }
-            Ok(())
         })?;
         Ok(EditResult { base_version: bv })
     }
@@ -534,6 +568,8 @@ impl StickyStore {
     }
 
     /// 状态标签。`#overdue` 只读（PRD D4）——不可设置、不可清除。
+    /// v0.8 适配：doing 的开/关映射到状态机 Doing/Paused（含遗留无 ts 补启），
+    /// 其余情况无操作（保持旧幂等语义，不再直接增删标签）。
     pub fn set_flag(
         &self, notebook: &str,
         kind: &FileKind,
@@ -545,24 +581,37 @@ impl StickyStore {
         if flag == Flag::Overdue {
             return Err(CmdError::bad_request("#overdue 只读：由外部例程维护"));
         }
-        let bv = self.edit(notebook, kind, base_version, |f| {
-            if on {
-                f.add_flag(line_idx, flag)
-            } else {
-                f.remove_flag(line_idx, flag)
+        let now = Self::unix_now();
+        let bv = self.edit(notebook, kind, base_version, move |f| {
+            let cur = f.status_at(line_idx)?;
+            match (on, cur) {
+                (true, _) => f.set_status_at(line_idx, crate::parser::TaskStatus::Doing, now),
+                (false, crate::parser::TaskStatus::Doing) => {
+                    f.set_status_at(line_idx, crate::parser::TaskStatus::Paused, now)
+                }
+                (false, _) => Ok(()),
             }
         })?;
         Ok(EditResult { base_version: bv })
     }
 
+    /// 内容替换（可选子行三态：None 保留旧子行 / Some([]) 清空 / Some(vec) 替换）。
     pub fn set_content(
         &self, notebook: &str,
         kind: &FileKind,
         line_idx: usize,
         content: &str,
+        sub_lines: Option<Vec<String>>,
         base_version: u64,
     ) -> Result<EditResult, CmdError> {
-        let bv = self.edit(notebook, kind, base_version, |f| f.set_content(line_idx, content))?;
+        let bv = self.edit(notebook, kind, base_version, move |f| {
+            f.set_content(line_idx, content)?;
+            // 行内手术先行（行号不变），子行整块替换随后（行数变化触发全量重建）
+            if let Some(subs) = sub_lines.as_deref() {
+                f.replace_sub_lines(line_idx, subs)?;
+            }
+            Ok(())
+        })?;
         Ok(EditResult { base_version: bv })
     }
 
@@ -610,12 +659,14 @@ impl StickyStore {
         Ok(EditResult { base_version: bv })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_task(
         &self, notebook: &str,
         kind: &FileKind,
         cat: Category,
         prio: Priority,
         text: &str,
+        subs: &[String],
         base_version: u64,
     ) -> Result<AddResult, CmdError> {
         let section = match kind {
@@ -624,7 +675,7 @@ impl StickyStore {
         };
         let mut line = usize::MAX;
         let bv = self.edit(notebook, kind, base_version, |f| {
-            line = f.add_task(section, cat, prio, text)?;
+            line = f.add_task(section, cat, prio, text, subs)?;
             Ok(())
         })?;
         Ok(AddResult { base_version: bv, line_idx: line })
@@ -655,8 +706,9 @@ impl StickyStore {
         Ok(LeftoversDto { date: yesterday.rel_path(), count, tasks })
     }
 
-    /// F14「复制到今天」：只复制 文本+优先级+分类（D5——#overdue 等状态是旧日期的，不带）。
-    /// 昨日原条目不动。base_version 校验的是**今天**的文件。
+    /// F14「复制到今天」：复制 文本+优先级+分类+子行（D5——#overdue 等状态是
+    /// 旧日期的，不带；v0.8 起子行随主行一起复制）。昨日原条目不动。
+    /// base_version 校验的是**今天**的文件。
     pub fn copy_leftover_to_today(
         &self, notebook: &str,
         today: chrono::NaiveDate,
@@ -664,7 +716,7 @@ impl StickyStore {
         base_version: u64,
     ) -> Result<AddResult, CmdError> {
         let yesterday = FileKind::Day(today - Duration::days(1));
-        let (content, prio, cat) = {
+        let (content, prio, cat, subs) = {
             let _g = self.io_lock();
             let text = self
                 .read_file(notebook, &yesterday)?
@@ -675,12 +727,12 @@ impl StickyStore {
                 .iter()
                 .find(|t| t.line_idx == line_idx)
                 .ok_or_else(|| CmdError::bad_request("line 不是昨日任务行"))?;
-            (t.content.clone(), t.priority, t.category)
+            (t.content.clone(), t.priority, t.category, t.sub_lines.clone())
         };
         let today_kind = FileKind::Day(today);
         let mut line = usize::MAX;
         let bv = self.edit(notebook, &today_kind, base_version, |f| {
-            line = f.add_task(DAY_TASK_SECTION, cat, prio.unwrap_or(Priority::P1), &content)?;
+            line = f.add_task(DAY_TASK_SECTION, cat, prio.unwrap_or(Priority::P1), &content, &subs)?;
             if prio.is_none() {
                 f.set_priority(line, None)?;
             }
@@ -761,6 +813,18 @@ pub fn parse_flag(word: &str) -> Result<Flag, CmdError> {
         "doing" => Ok(Flag::Doing),
         "overdue" => Ok(Flag::Overdue),
         other => Err(CmdError::bad_request(format!("未知标签: {other}（应为 doing）"))),
+    }
+}
+
+/// v0.8 set_status 的目标态：doing | paused | done。todo 是一次性初始态，
+/// 一旦离开永不回归（任何命令不可选）。
+pub fn parse_status(word: &str) -> Result<crate::parser::TaskStatus, CmdError> {
+    match word {
+        "doing" => Ok(crate::parser::TaskStatus::Doing),
+        "paused" => Ok(crate::parser::TaskStatus::Paused),
+        "done" => Ok(crate::parser::TaskStatus::Done),
+        "todo" => Err(CmdError::bad_request("待开始是一次性初始状态，一旦离开不可恢复")),
+        other => Err(CmdError::bad_request(format!("未知状态: {other}（应为 doing | paused | done）"))),
     }
 }
 

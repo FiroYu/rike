@@ -236,6 +236,8 @@ impl GixBackend {
         Ok(())
     }
 
+    // protocol::Error 为 gix 外部类型，Err 体积无法缩小，接受该 lint。
+    #[allow(clippy::result_large_err)]
     fn credentials(pat: Option<String>) -> impl FnMut(gix::credentials::helper::Action) -> gix::credentials::protocol::Result {
         move |action| {
             use gix::credentials::{helper::Action, protocol::Outcome};
@@ -262,7 +264,7 @@ impl GixBackend {
         // gix updates fetch reflogs using the repository's cached committer.
         // Fill missing identity, then reopen so its cache sees the persisted values.
         Self::signature(repo)?;
-        let reopened = Self::open(repo.work_dir().ok_or_else(|| git("缺少工作区"))?)?;
+        let reopened = Self::open(repo.workdir().ok_or_else(|| git("缺少工作区"))?)?;
         let repo = &reopened;
         let url = Self::config_value(repo, "remote.origin.url").ok_or_else(|| git("缺少 origin"))?;
         if let Some(path) = Self::local_path(&url)? {
@@ -390,7 +392,7 @@ impl GixBackend {
             };
             if entry.stage_raw() != 0 { return Err(git("索引存在未解决的冲突")); }
             let path = entry.path(index).to_str().map_err(git)?.to_owned();
-            Self::path(repo.work_dir().unwrap_or(repo.git_dir()), &path)?;
+            Self::path(repo.workdir().unwrap_or(repo.git_dir()), &path)?;
             files.insert(path, (kind, repo.find_blob(entry.id).map_err(git)?.data.to_vec()));
         }
         Ok(files)
@@ -402,7 +404,7 @@ impl GixBackend {
     }
 
     fn worktree_files(repo: &Repository) -> Result<Files> {
-        let root = repo.work_dir().ok_or_else(|| git("缺少工作区"))?;
+        let root = repo.workdir().ok_or_else(|| git("缺少工作区"))?;
         let index = repo.index_or_empty().map_err(git)?;
         let mut paths: BTreeSet<String> = index.entries().iter().map(|e| e.path(&index).to_str().map(str::to_owned))
             .collect::<std::result::Result<_, _>>().map_err(git)?;
@@ -440,7 +442,7 @@ impl GixBackend {
     fn dirty(repo: &Repository) -> Result<bool> {
         let head = Self::head_files(repo)?;
         let index = repo.index_or_empty().map_err(git)?;
-        Ok(Self::files_from_index(repo, &**index)? != head
+        Ok(Self::files_from_index(repo, &index)? != head
             || Self::worktree_files(repo)? != head)
     }
 
@@ -467,7 +469,7 @@ impl GixBackend {
 
     fn checkout(repo: &Repository, target: ObjectId) -> Result<()> {
         Self::require_clean(repo)?;
-        let root = repo.work_dir().ok_or_else(|| git("缺少工作区"))?;
+        let root = repo.workdir().ok_or_else(|| git("缺少工作区"))?;
         let old = Self::head_files(repo)?;
         let tree = repo.find_commit(target).map_err(git)?.tree_id().map_err(git)?.detach();
         let next = Self::files_from_index(repo, &repo.index_from_tree(&tree).map_err(git)?)?;
@@ -830,8 +832,8 @@ fn advertised_oid(data: &[u8], branch: &str) -> Result<ObjectId> {
         }
         let (oid, name) = reference.split_once(' ').ok_or_else(|| git("无效的远端引用"))?;
         let oid = ObjectId::from_hex(oid.as_bytes()).map_err(git)?;
-        if name == branch {
-            if old.replace(oid).is_some() { return Err(git("重复的远端分支")); }
+        if name == branch && old.replace(oid).is_some() {
+            return Err(git("重复的远端分支"));
         }
         count += 1;
     }
@@ -881,10 +883,12 @@ fn response_bytes(mut response: reqwest::blocking::Response, content_type: &str)
 // Buffering is deliberate for the small journal and avoids a worker/runtime per
 // request. Both header/body readers observe the same single request/result.
 struct RustlsHttp(reqwest::blocking::Client);
+type HttpOutcome = std::result::Result<(Vec<u8>, Vec<u8>), (io::ErrorKind, String)>;
+
 struct HttpExchange {
     request: Option<reqwest::blocking::RequestBuilder>,
     upload: Vec<u8>,
-    response: Option<std::result::Result<(Vec<u8>, Vec<u8>), (io::ErrorKind, String)>>,
+    response: Option<HttpOutcome>,
 }
 struct HttpReader { shared: Arc<Mutex<HttpExchange>>, headers: bool, offset: usize }
 struct HttpWriter(Arc<Mutex<HttpExchange>>);

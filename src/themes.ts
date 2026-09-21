@@ -2,10 +2,6 @@
 export {};
 const themes = [
   { id: "classic", name: "极简黑标", paper: "#f4f3f0", ink: "#16181a", detail: "素纸 · 黑墨" },
-  { id: "kraft", name: "牛皮手帐", paper: "#eee0c6", ink: "#513c2c", detail: "牛皮纸 · 棕墨" },
-  { id: "cream", name: "奶油横线", paper: "#fff9e9", ink: "#544633", detail: "横线纸 · 蜜金" },
-  { id: "sage", name: "鼠尾草格纸", paper: "#edf2e7", ink: "#304f41", detail: "方格纸 · 森绿" },
-  { id: "rose", name: "樱粉手帐", paper: "#fbefef", ink: "#704653", detail: "装订边 · 玫瑰" },
   { id: "midnight", name: "午夜墨蓝", paper: "#1d2837", ink: "#edf1f7", detail: "深色纸 · 银墨" },
   { id: "mist", name: "雾蓝点阵", paper: "#edf3f8", ink: "#355571", detail: "点阵纸 · 雾蓝" },
 ] as const;
@@ -14,6 +10,35 @@ const storageKey = "sticky-todo.theme";
 const options = document.querySelector<HTMLElement>("#theme-options")!;
 const panel = document.querySelector<HTMLDetailsElement>("#appearance")!;
 const themeStatus = document.querySelector<HTMLElement>("#theme-status")!;
+
+// v0.8 字号五档：正文 px 乘数挂 --fs-scale，存档位索引（与主题同键位语义：本机私有）。
+const FONT_TIERS = [12, 13, 14, 15, 16] as const;
+const FONT_DEFAULT_IDX = 1;
+const fontStorageKey = "sticky.fontscale";
+const fontDown = document.querySelector<HTMLButtonElement>("#font-down")!;
+const fontUp = document.querySelector<HTMLButtonElement>("#font-up")!;
+const fontLabel = document.querySelector<HTMLElement>("#font-size-label")!;
+let fontIdx = FONT_DEFAULT_IDX;
+
+function applyFontSize(idx: number, persist: boolean): void {
+  fontIdx = Math.min(Math.max(Math.trunc(idx), 0), FONT_TIERS.length - 1);
+  const px = FONT_TIERS[fontIdx];
+  document.documentElement.style.setProperty("--fs-scale", String(px / 13));
+  fontLabel.textContent = String(px);
+  fontDown.disabled = fontIdx === 0;
+  fontUp.disabled = fontIdx === FONT_TIERS.length - 1;
+  if (persist) {
+    try {
+      localStorage.setItem(fontStorageKey, String(fontIdx));
+      themeStatus.textContent = "已保存 · 仅用于这台设备";
+    } catch {
+      themeStatus.textContent = "已调整；当前无法保存，重启后将恢复默认";
+    }
+  }
+}
+
+fontDown.addEventListener("click", () => applyFontSize(fontIdx - 1, true));
+fontUp.addEventListener("click", () => applyFontSize(fontIdx + 1, true));
 
 function applyTheme(id: string, persist: boolean): void {
   const theme = themes.find((t) => t.id === id) ?? themes[0];
@@ -62,3 +87,10 @@ panel.addEventListener("keydown", (event) => {
 let saved = "classic";
 try { saved = localStorage.getItem(storageKey) ?? saved; } catch { /* 当前会话仍可切换外观。 */ }
 applyTheme(saved, false);
+
+let savedFontIdx = FONT_DEFAULT_IDX;
+try {
+  const raw = Number.parseInt(localStorage.getItem(fontStorageKey) ?? "", 10);
+  if (Number.isInteger(raw) && raw >= 0 && raw < FONT_TIERS.length) savedFontIdx = raw;
+} catch { /* 读取失败用默认档，会话内仍可调节。 */ }
+applyFontSize(savedFontIdx, false);

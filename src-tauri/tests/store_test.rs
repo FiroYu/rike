@@ -48,7 +48,8 @@ fn setup_store(name: &str) -> (PathBuf, String) {
     git(&base, &["init", "--bare", &remote.to_string_lossy()]);
     let url = format!("file:///{}", remote.to_string_lossy().replace('\\', "/"));
     git(&base, &["clone", &url, &a.to_string_lossy()]);
-    for dir in [&a] {
+    {
+        let dir = &a;
         git(dir, &["config", "user.name", "Test"]);
         git(dir, &["config", "user.email", "test@example.com"]);
     }
@@ -93,7 +94,7 @@ fn rejected_first_edit_does_not_create_file_or_stale_the_next_add() {
     assert_eq!(err.code, "bad_request");
     assert!(!day.abs_path(&a).exists(), "rejected input must leave the file absent");
     assert_eq!(store.take_pending_edits(), 0);
-    store.add_task("default", &day, Category::Work, Priority::P1, "有效任务", 0).unwrap();
+    store.add_task("default", &day, Category::Work, Priority::P1, "有效任务", &[], 0).unwrap();
     assert_eq!(store.get_view("default", day).unwrap().tasks.len(), 1);
 }
 
@@ -137,7 +138,7 @@ fn missing_file_created_from_template_on_first_write() {
     assert!(!a.join("days/2026-09-10.md").exists());
 
     let r = store
-        .add_task("default", &day, Category::Work, Priority::P1, "测试任务", 0)
+        .add_task("default", &day, Category::Work, Priority::P1, "测试任务", &[], 0)
         .unwrap();
     let text = read(&a, "days/2026-09-10.md");
     assert!(text.starts_with("# 2026-09-10 (周四)\n"), "实际首行: {}", &text[..text.find('\n').unwrap()]);
@@ -145,7 +146,7 @@ fn missing_file_created_from_template_on_first_write() {
     assert!(text.contains("## 备注"), "模板尾部段落保留");
 
     // 新建后的 base_version 能继续编辑
-    store.set_content("default", &day, r.line_idx, "改名任务", r.base_version).unwrap();
+    store.set_content("default", &day, r.line_idx, "改名任务", None, r.base_version).unwrap();
     assert!(read(&a, "days/2026-09-10.md").contains("改名任务"));
 }
 
@@ -280,7 +281,7 @@ fn manual_sync_now_pushes_edit() {
     );
 
     let day = FileKind::Day(d("2026-09-10"));
-    store.add_task("default", &day, Category::Work, Priority::P1, "手动同步任务", 0).unwrap();
+    store.add_task("default", &day, Category::Work, Priority::P1, "手动同步任务", &[], 0).unwrap();
     // 编辑后短暂停留：无防抖后不应自动推送（tick=10s，远大于停留窗口）
     std::thread::sleep(Duration::from_millis(300));
     assert!(
@@ -319,7 +320,7 @@ fn scheduler_stop_flushes_pending_edit() {
 
     let day = FileKind::Day(d("2026-09-10"));
     assert!(wait_until(Duration::from_secs(3), || store.get_view("default", day).is_ok()));
-    store.add_task("default", &day, Category::Personal, Priority::P2, "退出前任务", 0).unwrap();
+    store.add_task("default", &day, Category::Personal, Priority::P2, "退出前任务", &[], 0).unwrap();
     // 不等 tick，直接退出 flush
     assert!(sched.stop(Duration::from_secs(5)), "flush 应在超时前完成");
     assert_eq!(store.engine().unpushed_count().unwrap(), 0, "退出时无积压");
@@ -343,7 +344,7 @@ fn wrong_origin_blocks_startup_manual_retry_tick_and_exit_sync() {
     assert!(wait_until(Duration::from_secs(3), || matches!(store.status(), SyncUiState::Error { .. })));
     let day = FileKind::Day(d("2026-09-10"));
     assert_eq!(store.get_view("default", day).unwrap_err().code, "repo_not_ready");
-    assert_eq!(store.add_task("default", &day, Category::Work, Priority::P1, "不得写错仓库", 0).unwrap_err().code, "repo_not_ready");
+    assert_eq!(store.add_task("default", &day, Category::Work, Priority::P1, "不得写错仓库", &[], 0).unwrap_err().code, "repo_not_ready");
     store.request_sync_now();
     assert!(wait_until(Duration::from_secs(3), || ev.lock().unwrap().iter()
         .filter(|(name, payload)| name == "sync-status" && payload.contains("\"error\"")).count() >= 4));
@@ -407,7 +408,8 @@ fn scheduler_tick_silent_pulls_remote_changes() {
 
 const DAY_TEXT2: &str = "# 2026-09-10 (周四)\n\n## 日任务\n- [ ] (P1) [工作] 联系供应商 #doing\n- [ ] (P2) [个人] 买咖啡\n";
 
-/// Sprint 4：完成即不再「进行中」——set_checked(true) 连带清 #doing。
+/// Sprint 4（v0.8 语义更新）：完成即不再「进行中」——set_checked(true) 连带清
+/// #doing，且首离待开始即写 `#t 0`（零值不可省略）；取消勾选 = 复活为暂停。
 #[test]
 fn set_checked_true_strips_doing() {
     let (a, _url) = setup_store("strip-doing");
@@ -421,12 +423,17 @@ fn set_checked_true_strips_doing() {
 
     let r = store.set_checked("default", &day, li, true, v.base_version).unwrap();
     let text = read(&a, "days/2026-09-10.md");
-    assert!(text.contains("- [x] (P1) [工作] 联系供应商\n"), "勾选且无 #doing: {text}");
+    assert!(text.contains("- [x] (P1) [工作] 联系供应商 #t 0\n"), "勾选且无 #doing（v0.8 落盘 #t 0）: {text}");
 
-    // 取消勾选不反向加 #doing（幂等方向唯一）
+    // v0.8.1：取消勾选 = 复活为暂停（清 [x]，写 #paused，累计冻结无 #ts）
     let v2 = store.get_view("default", day).unwrap();
     store.set_checked("default", &day, li, false, v2.base_version).unwrap();
-    assert!(read(&a, "days/2026-09-10.md").contains("- [ ] (P1) [工作] 联系供应商\n"));
+    let revived = read(&a, "days/2026-09-10.md");
+    assert!(revived.contains("#t 0 #paused"));
+    assert!(!revived.contains("#ts"));
+    let task = &store.get_view("default", day).unwrap().tasks[0];
+    assert_eq!(task.status, TaskStatus::Paused);
+    assert_eq!(task.timer_secs, v2.tasks[0].timer_secs);
     let _ = r;
 }
 
@@ -481,7 +488,7 @@ fn notebooks_sync_bidirectionally_with_names_and_daily_source_state() {
     let store_a = StickyStore::new(&a);
     let book = store_a.save_notebook(None, "独立项目", 0).unwrap();
     let day = FileKind::Day(d("2026-09-10"));
-    store_a.add_task(&book.id, &day, Category::Work, Priority::P1, "跨机任务", 0).unwrap();
+    store_a.add_task(&book.id, &day, Category::Work, Priority::P1, "跨机任务", &[], 0).unwrap();
     store_a.engine().sync_cycle("test: create notebook").unwrap();
 
     let b = a.parent().unwrap().join("b");
@@ -501,4 +508,223 @@ fn notebooks_sync_bidirectionally_with_names_and_daily_source_state() {
     assert!(store_a.get_view(&book.id, day).unwrap().tasks[0].checked);
     assert!(store_a.get_view("default", day).unwrap().tasks.is_empty());
     assert!(!a.join("notebooks").join(&book.id).join("weeks").exists());
+}
+
+// ---------- v0.8：set_task_status 命令组 / edit 短路 / 旧命令适配 / 子行三态 ----------
+
+use app_lib::parser::{Flag, TaskStatus};
+use app_lib::store::parse_status;
+
+/// parse_status：doing|paused|done；todo 拒绝（一次性初始态）。
+#[test]
+fn v08_parse_status_words() {
+    assert_eq!(parse_status("doing").unwrap(), TaskStatus::Doing);
+    assert_eq!(parse_status("paused").unwrap(), TaskStatus::Paused);
+    assert_eq!(parse_status("done").unwrap(), TaskStatus::Done);
+    assert_eq!(parse_status("todo").unwrap_err().code, "bad_request");
+    assert_eq!(parse_status("blocked").unwrap_err().code, "bad_request");
+}
+
+/// set_task_status 全链：待开始→进行中（写 #t 0 + ts）→暂停（结算）→完成→复活。
+/// ts 是服务端时钟，只断言结构不锁具体值。
+#[test]
+fn v08_set_task_status_chain() {
+    let (a, _url) = setup_store("v08-status-chain");
+    let store = StickyStore::new(&a);
+    let day = FileKind::Day(d("2026-09-10"));
+    write(&a, "days/2026-09-10.md", DAY_TEXT);
+    let v = store.get_view("default", day).unwrap();
+    let li = v.tasks[0].line_idx;
+    assert_eq!(v.tasks[0].status, TaskStatus::Todo);
+    assert_eq!(v.tasks[0].timer_secs, 0);
+
+    // 待开始 → 进行中
+    let r1 = store.set_task_status("default", &day, li, TaskStatus::Doing, v.base_version).unwrap();
+    let text = read(&a, "days/2026-09-10.md");
+    assert!(text.contains("- [ ] (P1) [工作] 写周报 #t 0 #doing #ts "), "落盘: {text}");
+    // 视图派生：Doing、计时起点有值
+    let v2 = store.get_view("default", day).unwrap();
+    assert_eq!(v2.tasks[0].status, TaskStatus::Doing);
+    assert!(v2.tasks[0].timer_started_at.is_some());
+
+    // 进行中 → 暂停（真实时钟下 delta 不可控，只验结构与 ts 清除）
+    store.set_task_status("default", &day, li, TaskStatus::Paused, r1.base_version).unwrap();
+    let text = read(&a, "days/2026-09-10.md");
+    assert!(text.contains("#paused"), "暂停标签: {text}");
+    assert!(!text.contains("#ts"), "暂停删起点: {text}");
+    let v3 = store.get_view("default", day).unwrap();
+    assert_eq!(v3.tasks[0].status, TaskStatus::Paused);
+    assert_eq!(v3.tasks[0].timer_started_at, None);
+
+    // 暂停 → 完成
+    let r3 = store.set_task_status("default", &day, li, TaskStatus::Done, v3.base_version).unwrap();
+    let text = read(&a, "days/2026-09-10.md");
+    assert!(text.contains("- [x] (P1) [工作] 写周报 #t "), "完成态: {text}");
+    assert!(!text.contains("#doing") && !text.contains("#paused"));
+
+    // 完成 → 复活进行中（续计不清零：#t 保留原值）
+    store.set_task_status("default", &day, li, TaskStatus::Doing, r3.base_version).unwrap();
+    let text = read(&a, "days/2026-09-10.md");
+    assert!(text.contains("- [ ] (P1) [工作] 写周报 #t 0 #doing #ts "), "复活: {text}");
+}
+
+/// edit 空操作短路：同态 set_status 零 pending、文件字节不变、版本原样返回。
+#[test]
+fn v08_edit_noop_short_circuit() {
+    let (a, _url) = setup_store("v08-noop");
+    let store = StickyStore::new(&a);
+    let day = FileKind::Day(d("2026-09-10"));
+    write(&a, "days/2026-09-10.md", DAY_TEXT);
+
+    let v = store.get_view("default", day).unwrap();
+    let li = v.tasks[0].line_idx;
+    let bv: u64 = v.base_version;
+
+    // 待开始 → Paused（首离即写 #t 0）
+    let r = store.set_task_status("default", &day, li, TaskStatus::Paused, bv).unwrap();
+    assert_eq!(store.take_pending_edits(), 1);
+    let after = read(&a, "days/2026-09-10.md");
+
+    // 同态 Paused → Paused：零写盘零 pending，版本原样
+    let r2 = store.set_task_status("default", &day, li, TaskStatus::Paused, r.base_version).unwrap();
+    assert_eq!(store.take_pending_edits(), 0, "同态短路不计 pending");
+    assert_eq!(read(&a, "days/2026-09-10.md"), after, "文件字节不变");
+    assert_eq!(r2.base_version, r.base_version, "版本原样返回");
+}
+
+/// 旧命令适配：set_flag(doing, on) 与 set_checked 的状态机语义。
+#[test]
+fn v08_legacy_commands_adapted() {
+    let (a, _url) = setup_store("v08-legacy");
+    let store = StickyStore::new(&a);
+    let day = FileKind::Day(d("2026-09-10"));
+    write(&a, "days/2026-09-10.md", DAY_TEXT);
+
+    // overdue 恒拒（只读）
+    let v = store.get_view("default", day).unwrap();
+    let li = v.tasks[0].line_idx;
+    assert_eq!(store.set_flag("default", &day, li, Flag::Overdue, true, 0).unwrap_err().code, "bad_request");
+
+    // set_flag(doing, true)：待开始 → 进行中
+    let r = store.set_flag("default", &day, li, Flag::Doing, true, v.base_version).unwrap();
+    assert!(read(&a, "days/2026-09-10.md").contains("#doing #ts "));
+
+    // set_flag(doing, false)：进行中 → 暂停
+    let r2 = store.set_flag("default", &day, li, Flag::Doing, false, r.base_version).unwrap();
+    assert!(read(&a, "days/2026-09-10.md").contains("#paused"));
+
+    // set_flag(doing, false) 于非进行中：无操作（先排空此前两笔真实编辑的 pending）
+    let _ = store.take_pending_edits();
+    store.set_flag("default", &day, li, Flag::Doing, false, r2.base_version).unwrap();
+    assert_eq!(store.take_pending_edits(), 0, "无操作不计 pending");
+
+    // set_checked(true)：任何态 → 完成
+    let r3 = store.set_checked("default", &day, li, true, r2.base_version).unwrap();
+    assert!(read(&a, "days/2026-09-10.md").contains("- [x] "));
+
+    let frozen = store.get_view("default", day).unwrap().tasks[0].timer_secs;
+    // set_checked(false) 于完成 → 复活暂停；于未完成 → 无操作
+    store.set_checked("default", &day, li, false, r3.base_version).unwrap();
+    let text = read(&a, "days/2026-09-10.md");
+    assert!(text.contains("#paused"));
+    assert!(!text.contains("#ts"));
+    let task = &store.get_view("default", day).unwrap().tasks[0];
+    assert_eq!(task.status, TaskStatus::Paused);
+    assert_eq!(task.timer_secs, frozen);
+}
+
+/// set_content 子行三态：None 保留 / [] 清空 / 非空整体替换。
+#[test]
+fn v08_set_content_sub_lines_three_states() {
+    let (a, _url) = setup_store("v08-sublines");
+    let store = StickyStore::new(&a);
+    let day = FileKind::Day(d("2026-09-10"));
+    let orig = "# D\n\n## 日任务\n- [ ] (P1) 主任务\n  旧子行A\n  旧子行B\n- [ ] (P2) 次任务\n";
+    write(&a, "days/2026-09-10.md", orig);
+
+    let v = store.get_view("default", day).unwrap();
+    let li = v.tasks[0].line_idx;
+    assert_eq!(v.tasks[0].sub_lines, vec!["旧子行A".to_string(), "旧子行B".to_string()]);
+    let bv = v.base_version;
+
+    // None：保留子行，只改主行内容
+    let r = store.set_content("default", &day, li, "改名后的主任务", None, bv).unwrap();
+    let text = read(&a, "days/2026-09-10.md");
+    assert!(text.contains("- [ ] (P1) 改名后的主任务\n  旧子行A\n  旧子行B\n"), "None 保留: {text}");
+
+    // 非空：整体替换
+    let r2 = store.set_content("default", &day, li, "再改名", Some(vec!["新子1".into(), "新子2".into()]), r.base_version).unwrap();
+    let text = read(&a, "days/2026-09-10.md");
+    assert!(text.contains("- [ ] (P1) 再改名\n  新子1\n  新子2\n- [ ] (P2)"), "替换: {text}");
+    let v2 = store.get_view("default", day).unwrap();
+    assert_eq!(v2.tasks[0].sub_lines, vec!["新子1".to_string(), "新子2".to_string()]);
+
+    // []：清空
+    store.set_content("default", &day, li, "再改名", Some(vec![]), r2.base_version).unwrap();
+    let text = read(&a, "days/2026-09-10.md");
+    assert!(text.contains("- [ ] (P1) 再改名\n- [ ] (P2) 次任务\n"), "清空: {text}");
+    assert!(!text.contains("子"));
+}
+
+/// add_task 带子行：主行+缩进子行整块插入；get_view 回读剥缩进。
+#[test]
+fn v08_add_task_with_sub_lines() {
+    let (a, _url) = setup_store("v08-add-subs");
+    let store = StickyStore::new(&a);
+    let day = FileKind::Day(d("2026-09-10"));
+    write(&a, "days/2026-09-10.md", DAY_TEXT);
+    let v0 = store.get_view("default", day).unwrap();
+
+    let r = store.add_task("default", &day, Category::Work, Priority::P2, "多行任务", &["第一行说明".to_string(), "第二行说明".to_string()], v0.base_version).unwrap();
+    let text = read(&a, "days/2026-09-10.md");
+    assert!(text.contains("- [ ] (P2) [工作] 多行任务\n  第一行说明\n  第二行说明\n"), "落盘缩进: {text}");
+    let v = store.get_view("default", day).unwrap();
+    let t = v.tasks.iter().find(|t| t.content == "多行任务").unwrap();
+    assert_eq!(t.sub_lines.len(), 2);
+    assert_eq!(t.line_idx, r.line_idx);
+}
+
+/// 昨日遗留复制带子行（copy_leftover_to_today 保留块结构）。
+#[test]
+fn v08_copy_leftover_keeps_sub_lines() {
+    let (a, _url) = setup_store("v08-copy-subs");
+    let store = StickyStore::new(&a);
+    let today = FileKind::Day(d("2026-09-10"));
+    write(&a, "days/2026-09-09.md", "# 09\n\n## 日任务\n- [ ] (P1) 带说明的遗留任务\n  说明第一行\n  说明第二行\n");
+    write(&a, "days/2026-09-10.md", DAY_TEXT);
+
+    let left = store.get_yesterday_leftovers("default", d("2026-09-10")).unwrap();
+    assert_eq!(left.tasks.len(), 1);
+    let v_today = store.get_view("default", today).unwrap();
+    store.copy_leftover_to_today("default", d("2026-09-10"), left.tasks[0].line_idx, v_today.base_version).unwrap();
+    let text = read(&a, "days/2026-09-10.md");
+    assert!(text.contains("- [ ] (P1) 带说明的遗留任务\n  说明第一行\n  说明第二行\n"), "子行随搬: {text}");
+    // F14 是复制不是搬移：昨日原行（含子行）保留
+    assert!(read(&a, "days/2026-09-09.md").contains("带说明的遗留任务"), "源保留");
+}
+
+#[test]
+fn unchecked_done_preserves_nonzero_frozen_timer() {
+    let temp = tempfile::tempdir().unwrap();
+    let a = temp.path();
+    git(a, &["init"]);
+    let store = StickyStore::new(a);
+    let day = FileKind::Day(d("2026-09-10"));
+    write(a, "days/2026-09-10.md", "## 日任务\n- [x] A #t 120\n");
+    let v = store.get_view("default", day).unwrap();
+    store.set_checked("default", &day, v.tasks[0].line_idx, false, v.base_version).unwrap();
+    let task = &store.get_view("default", day).unwrap().tasks[0];
+    assert_eq!(task.status, TaskStatus::Paused);
+    assert_eq!(task.timer_secs, 120);
+    assert_eq!(task.timer_started_at, None);
+    assert!(!read(a, "days/2026-09-10.md").contains("#ts"));
+}
+
+#[test]
+fn checkbox_copy_describes_paused_revival() {
+    let source = include_str!("../../src/render.ts");
+    assert!(source.contains("取消完成并恢复为暂停"));
+    assert!(source.contains("取消勾选：恢复为暂停，累计计时冻结不清零；点状态钮继续计时"));
+    assert!(!source.contains("取消完成并继续计时"));
+    assert!(!source.contains("复活回进行中，计时续跑"));
 }
