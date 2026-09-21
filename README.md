@@ -1,6 +1,6 @@
-# 日課 (nikka)
+# 日課 (rike)
 
-**English**: nikka is a Windows desktop sticky to-do widget — day/week linked views, automatic rollover of unfinished tasks, future-date scheduling, and multi-PC sync through your own Git repository. Built with Tauri 2 + Rust + TypeScript. No backend, no accounts: your tasks live as plain markdown files in a repo you own.
+**English**: rike is a Windows desktop sticky to-do widget — day/week linked views, automatic rollover of unfinished tasks, future-date scheduling, and multi-PC sync through your own Git repository. Built with Tauri 2 + Rust + TypeScript. No backend, no accounts: your tasks live as plain markdown files in a repo you own.
 
 Windows 桌面常驻待办贴纸：小窗口贴在桌面一角，日 / 周视图联动，未完成任务跨日自动流转，多台电脑通过你自己的 Git 仓库同步。当前版本 **0.8.4**。
 
@@ -20,12 +20,12 @@ Windows 桌面常驻待办贴纸：小窗口贴在桌面一角，日 / 周视图
 
 ## 安装（Windows 10/11）
 
-从 [Releases](https://github.com/FiroYu/nikka/releases) 下载：
+从 [Releases](https://github.com/FiroYu/rike/releases) 下载：
 
 | 文件 | 说明 |
 | --- | --- |
-| `nikka-0.8.4-x64-setup.exe` | NSIS 安装包（推荐） |
-| `nikka-0.8.4-x64-portable.exe` | 便携版，下载后直接运行 |
+| `rike-0.8.4-x64-setup.exe` | NSIS 安装包（推荐） |
+| `rike-0.8.4-x64-portable.exe` | 便携版，下载后直接运行 |
 
 依赖 WebView2（Windows 11 自带；Windows 10 缺失时安装包会自动处理）。
 

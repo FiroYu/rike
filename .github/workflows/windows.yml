@@ -29,7 +29,7 @@ jobs:
       - run: npm run tauri -- build --bundles nsis
       - uses: actions/upload-artifact@v4
         with:
-          name: nikka-windows
+          name: rike-windows
           path: |
             src-tauri/target/release/app.exe
             src-tauri/target/release/bundle/nsis/*-setup.exe

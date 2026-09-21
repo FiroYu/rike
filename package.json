@@ -1,12 +1,12 @@
 {
-  "name": "nikka",
+  "name": "rike",
   "private": true,
   "version": "0.7.0",
   "description": "日課 — Windows desktop sticky todo with git sync",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/FiroYu/nikka.git"
+    "url": "git+https://github.com/FiroYu/rike.git"
   },
   "type": "module",
   "scripts": {
