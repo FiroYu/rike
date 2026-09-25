@@ -355,7 +355,9 @@ const noteSquare = root.querySelector<HTMLTextAreaElement>("#note-square textare
 let notesRequestId = 0;
 
 function dirtyNotes(): HTMLTextAreaElement[] {
-  return (TOUCH_DEVICE ? Array.from(notesBody.querySelectorAll<HTMLTextAreaElement>(".notes-input")) : [noteSquare])
+  // 桌面与触摸同口径：常驻方块与速记面板的输入框一律计入草稿判定，
+  // 避免面板草稿被后台刷新（view-changed）或导航重绘清掉。
+  return [noteSquare, ...Array.from(notesBody.querySelectorAll<HTMLTextAreaElement>(".notes-input"))]
     .filter(input => input.value !== input.dataset.loaded);
 }
 
@@ -400,8 +402,15 @@ function loadNoteSquare(): Promise<void> {
       if (id !== squareRequestId || notebookId !== app.notebookId) return;
       const day = dto.days.find(day => day.date === date);
       if (!day) return;
-      const dirty = noteSquare.value !== noteSquare.dataset.loaded;
-      if (dirty) return;
+      if (noteSquare.value !== noteSquare.dataset.loaded) return;
+      if (noteSquare.value && noteSquare.value !== day.content) {
+        // 关窗兜底草稿与远端不同：保留草稿并视为未保存，交给正常保存流程落盘，
+        // 不被远端内容静默顶掉；本地兜底缓存同样保留，待保存成功后再刷新。
+        noteSquare.dataset.loaded = day.content;
+        noteSquare.dataset.baseVersion = day.base_version;
+        notesStatus.textContent = "已恢复未保存的速记草稿，失焦保存将覆盖远端";
+        return;
+      }
       if (noteSquare.value !== day.content) noteSquare.value = day.content;
       noteSquare.dataset.loaded = day.content;
       noteSquare.dataset.baseVersion = day.base_version;
@@ -416,8 +425,8 @@ function loadNoteSquare(): Promise<void> {
   return squareLoading;
 }
 
+noteSquare.dataset.loaded = ""; // 触摸端方块隐藏，但同样参与 dirtyNotes 判定，需先初始化口径
 if (!TOUCH_DEVICE) {
-  noteSquare.dataset.loaded = "";
   noteSquare.addEventListener("blur", () => { void saveNote(noteSquare); });
   root.querySelector("#note-square")!.addEventListener("mouseleave", () => { void saveNote(noteSquare); });
   void loadNoteSquare();
@@ -1436,9 +1445,13 @@ async function closeWindow(): Promise<void> {
       cacheNoteSquare(noteSquare.dataset.noteDate ?? todayStr(), noteSquare.value,
         noteSquare.dataset.notebookId ?? app.notebookId);
     }
+    // 速记面板里未保存的草稿同样落盘，不再只依赖 ExitRequested 兜底。
+    await Promise.all(Array.from(notesBody.querySelectorAll<HTMLTextAreaElement>(".notes-input"))
+      .filter(input => input.value !== input.dataset.loaded)
+      .map(input => saveNote(input).catch(() => false)));
   }
   const deadline = Date.now() + 3000;
-  while (Date.now() < deadline && (mutationPending || noteSquare.dataset.saving === "true")) {
+  while (Date.now() < deadline && (mutationPending || noteSquare.dataset.saving === "true" || notesBody.querySelector('[data-saving="true"]'))) {
     await new Promise(resolve => setTimeout(resolve, 80));
   }
   try {
