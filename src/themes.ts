@@ -1,10 +1,14 @@
 /** 本机外观偏好独立于任务数据，切换不会重绘清单或打断输入。 */
 export {};
-const themes = [
+// 毛玻璃依赖 Windows 系统亚克力（tauri.conf windowEffects + transparent），
+// 其他端（Android WebView）不投放该选项，外观与默认值均回到 classic。
+const isWindows = /Windows NT/.test(navigator.userAgent);
+const themes = ([
+  { id: "glass", name: "毛玻璃", paper: "#e9edf4", ink: "#16181a", detail: "玻璃 · 透桌面" },
   { id: "classic", name: "极简黑标", paper: "#f4f3f0", ink: "#16181a", detail: "素纸 · 黑墨" },
   { id: "midnight", name: "午夜墨蓝", paper: "#1d2837", ink: "#edf1f7", detail: "深色纸 · 银墨" },
   { id: "mist", name: "雾蓝点阵", paper: "#edf3f8", ink: "#355571", detail: "点阵纸 · 雾蓝" },
-] as const;
+] as const).filter((t) => isWindows || t.id !== "glass");
 
 const storageKey = "sticky-todo.theme";
 const options = document.querySelector<HTMLElement>("#theme-options")!;
@@ -84,7 +88,7 @@ panel.addEventListener("keydown", (event) => {
   }
 });
 
-let saved = "classic";
+let saved: string = themes[0].id; // 无存档时默认首位（Windows=毛玻璃，其他端=极简黑标）
 try { saved = localStorage.getItem(storageKey) ?? saved; } catch { /* 当前会话仍可切换外观。 */ }
 applyTheme(saved, false);
 

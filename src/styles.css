@@ -26,11 +26,14 @@
 html { touch-action: manipulation; }
 [hidden] { display: none !important; }
 
-/* 窗口不透明（transparent:false）：WebView2 透明窗口下 Win11 IME 候选框
-   渲染成不透明白块盖住录入行（2026-09-11 实测），去透明是唯一可靠解。
-   投影改用 DWM 窗口投影（shadow:true）。body 底色=面板色：量高前的过渡帧
-   不露白边；.sticky 不设 min-height:100vh——那会把 scrollHeight 钉在
-   当前客户区高，窗口只会长高永不回缩（e2e P5 实测 before==after）。 */
+/* 窗口透明（transparent:true + windowEffects acrylic，毛玻璃分支）：玻璃主题下
+   html/body 透明（见文末玻璃区块），桌面由系统亚克力模糊；旧主题 --panel 不透明，
+   实底遮住亚克力，视觉与不透明窗口时代一致。历史：2026-09-11 纯透明窗口（无
+   backdrop）曾致 Win11 IME 候选框白块盖录入行而退回不透明；2026-09-22 毛玻璃
+   分支改用透明+系统亚克力组合（页面每像素均有 tint）复测，结论记录于分支提交。
+   body 底色跟随面板色（非玻璃主题）：量高前的过渡帧不露白边；.sticky 不设
+   min-height:100vh——那会把 scrollHeight 钉在当前客户区高，窗口只会长高
+   永不回缩（e2e P5 实测 before==after）。 */
 html, body { background: var(--panel); }
 
 body {
@@ -52,9 +55,8 @@ button:focus-visible, input:focus-visible, summary:focus-visible, [tabindex]:foc
   outline-offset: -2px;
 }
 
-/* 窗口不透明（transparent:false）：WebView2 透明窗口下 Win11 IME 候选框
-   渲染成不透明白块盖住录入行（2026-09-11 实测），去透明是唯一可靠解。
-   投影改用 DWM 窗口投影（shadow:true），面板铺满整个窗口。 */
+/* .sticky 铺满整个窗口：玻璃主题时 --panel 为半透明 tint（见文末玻璃区块），
+   其余主题为实底。投影用 DWM 窗口投影（shadow:true）。 */
 .sticky {
   position: relative;
   background: var(--paper-pattern), var(--panel);
@@ -616,6 +618,37 @@ button:focus-visible, input:focus-visible, summary:focus-visible, [tabindex]:foc
 }
 [data-theme="mist"] .sticky { background-size: 12px 12px; }
 [data-theme="mist"] .mast { border-top: 6px solid #85a8c3; }
+
+:root[data-theme="glass"] {
+  /* 毛玻璃：桌面已被系统亚克力模糊（tauri.conf windowEffects，Win11 忽略 color
+     参数），这里只叠一层半透明冷白纸面提供色调。行间细线/水洗色随之微调。
+     仅 Tauri 窗口内有意义——纯浏览器（vite dev）无窗口特效，0.55 会叠白底发虚。 */
+  --panel: rgba(236, 240, 246, 0.55);
+  --hairline: rgba(22, 24, 26, 0.14);
+  --wash: rgba(255, 255, 255, 0.22);
+}
+/* 单层 tint：玻璃主题下 html/body 透明，仅 .sticky 一层着色，避免双层叠 alpha。
+   旧主题 --panel 不透明，不走此规则——窗口虽透明但被实心底色完全遮盖，
+   视觉与改造前一致（亚克力被遮住不可见）。 */
+html[data-theme="glass"], html[data-theme="glass"] body { background: transparent; }
+
+/* 玻璃主题浮层：叠在页面内容之上，用更实的底 + 页内模糊保证可读性
+   （backdrop-filter 只模糊页面内容；桌面侧模糊由系统亚克力提供）。
+   名单含触屏 @media (hover:none) 形态的悬浮面（theme-panel/add-fab/add-open/
+   pull-hint/load-retry/固定页脚条）——Windows 触屏设备同样投放玻璃主题。
+   :is() 吸收 #add-slot .add-open 的 ID 特异性，整条 (1,2,1) 压过全部基础规则。 */
+html[data-theme="glass"] :is(.undo, .ctx, #date-pick, #notebook-panel, #notes-panel,
+  .theme-panel, .add-fab, #add-slot .add-open, .pull-hint, .load-retry, .footer-area) {
+  background: rgba(236, 240, 246, 0.82);
+  backdrop-filter: blur(14px) saturate(140%);
+}
+/* 玻璃主题下文档流内表面透明化，保住"仅 .sticky 一层 tint"不变式
+   （.appearance 桌面在页脚文档流内，叠在 tint 上会双层 80%）。 */
+html[data-theme="glass"] .appearance { background: transparent; }
+/* 输入面：录入/行内编辑文字需要更实的承托，避免与玻璃下的内容串色。 */
+html[data-theme="glass"] :is(#sync-settings-form input, .notes-input:focus, #note-square textarea:focus, .add-input:focus, .txt-input) {
+  background: rgba(236, 240, 246, 0.82);
+}
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
