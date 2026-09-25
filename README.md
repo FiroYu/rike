@@ -2,7 +2,7 @@
 
 **English**: rike is a Windows desktop sticky to-do widget — day/week linked views, automatic rollover of unfinished tasks, future-date scheduling, and multi-PC sync through your own Git repository. Built with Tauri 2 + Rust + TypeScript. No backend, no accounts: your tasks live as plain markdown files in a repo you own.
 
-Windows 桌面常驻待办贴纸：小窗口贴在桌面一角，日 / 周视图联动，未完成任务跨日自动流转，多台电脑通过你自己的 Git 仓库同步。当前版本 **0.8.4**。
+Windows 桌面常驻待办贴纸：小窗口贴在桌面一角，日 / 周视图联动，未完成任务跨日自动流转，多台电脑通过你自己的 Git 仓库同步。当前版本 **0.8.5**。
 
 ![界面预览](docs/app-screenshot-0.8.4.png)
 
@@ -13,8 +13,12 @@ Windows 桌面常驻待办贴纸：小窗口贴在桌面一角，日 / 周视图
 - **日 / 周联动**：日事项自动显示在所属周，日 / 周操作共用同一份任务状态；周视图标出事项来源日期。
 - **未来日期预排**：点报头日期跳到任意日期排任务——事项留在所属日期不提前进今天；到期即当天文件，过期未完成自动流转到今天。
 - **未完成自动流转**：昨天日任务未勾选自动搬入今天，勾掉即消失，不再手动誊写。
-- **任务管理**：优先级 P1/P2/P3、工作 / 个人分类、右键标记 `#doing` / `#blocked`（可附原因）、`#overdue` 只读展示；输入 Enter 保存、Esc 取消、Tab 切分类。
-- **7 款主题**：极简黑标、牛皮手帐、奶油横线、鼠尾草格纸、樱粉手帐、午夜墨蓝、雾蓝点阵，仅保存在本机。
+- **任务管理**：优先级 P0–P3 恒定排序显示、完成项全局沉底；工作 / 个人分类、右键标记 `#doing` / `#blocked`（可附原因）、`#overdue` 只读展示；输入 Enter 保存、Esc 取消、Tab 切分类。
+- **任务状态与计时**：每条任务一个状态钮——待开始 → 进行中 / 暂停切换，行尾勾选完成；完成后取消勾选恢复为暂停（累计计时冻结不清零）。进行中的任务自动累计时长，落盘为 `#t` / `#ts` 标签，99:59:59 封顶，窗口隐藏时停表。
+- **多行任务**：添加 / 编辑时 Shift+回车换行，落盘为两空格缩进的子行。
+- **优先级调档不跳位**：调整优先级期间显示序冻结（行原地换档），停止调整 1.5 秒后重排。
+- **正文字号五档**：12–16px 五档缩放，设置里 A− / A⁺ 即时生效，仅保存在本机。
+- **4 款主题**：极简黑标、雾蓝点阵、午夜墨蓝、毛玻璃（Windows 亚克力透桌面，新装默认）；旧主题存档自动沿用，仅保存在本机。
 - **Git 同步**：本地编辑立即落盘为 markdown（`days/*.md`、`weeks/*.md`）；30 分钟自动同步、可点页脚立即同步、退出时本地 commit 保底；多机并发靠 commit → pull --rebase → push 收敛。
 - **单实例**：同一台电脑同时只允许打开一个实例；报头 ✕ 关闭应用。
 
@@ -24,8 +28,8 @@ Windows 桌面常驻待办贴纸：小窗口贴在桌面一角，日 / 周视图
 
 | 文件 | 说明 |
 | --- | --- |
-| `rike-0.8.4-x64-setup.exe` | NSIS 安装包（推荐） |
-| `rike-0.8.4-x64-portable.exe` | 便携版，下载后直接运行 |
+| `rike-0.8.5-x64-setup.exe` | NSIS 安装包（推荐） |
+| `rike-0.8.5-x64-portable.exe` | 便携版，下载后直接运行 |
 
 依赖 WebView2（Windows 11 自带；Windows 10 缺失时安装包会自动处理）。
 
