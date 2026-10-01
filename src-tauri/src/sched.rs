@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use chrono::Local;
 
 use crate::store::{StickyStore, SyncUiState, repo_url};
-use crate::sync::{commit_prefix, SyncError};
+use crate::sync::{commit_prefix, SyncError, SyncStatus};
 
 /// 调度消息。SyncNow 由命令层投递（点角标），FlushNow 仅退出流程使用。
 pub enum SchedMsg {
@@ -306,7 +306,7 @@ fn rollover_rescan(store: &Arc<StickyStore>, emit: &EmitFn) {
 
 fn commit_message(pending: usize) -> String {
     let d = today().format("%Y-%m-%d");
-    // PRD 形如 `sticky@office: 2026-09-10 add 3 / done 2 (day, week)`——v1 汇总为编辑计数
+    // PRD 形如 `sticky@<machine>: 2026-09-10 add 3 / done 2 (day, week)`——v1 汇总为编辑计数
     format!("{} {d} {pending} edits", commit_prefix())
 }
 
@@ -321,6 +321,13 @@ fn full_sync(store: &Arc<StickyStore>, timing: &SchedTiming, retry_at: &mut Opti
     let result = store.engine().sync_cycle_staged(&msg, store.io_mutex());
 
     match result {
+        // 冲突已语义合并推送：亮「已自动合并」角标，不阻塞流转
+        Ok(SyncStatus::Pushed { auto_merged, .. }) if !auto_merged.is_empty() => {
+            *retry_at = None;
+            store.set_status(SyncUiState::Merged { files: auto_merged });
+            #[cfg(windows)]
+            rollover_rescan(store, emit);
+        }
         Ok(_) => {
             *retry_at = None;
             store.set_status(SyncUiState::Idle);
@@ -356,7 +363,11 @@ fn silent_pull(store: &Arc<StickyStore>, retry_at: &mut Option<Instant>, emit: &
     let before = store.watched_fingerprints(today());
     let result = store.engine().pull_staged(store.io_mutex());
     match result {
-        Ok(()) => {
+        Ok(auto_merged) => {
+            if !auto_merged.is_empty() {
+                store.set_status(SyncUiState::Merged { files: auto_merged });
+                emit_status(store, emit);
+            }
             #[cfg(windows)]
             rollover_rescan(store, emit);
         }

@@ -2,16 +2,17 @@
 //!
 //! **base_version 防陈旧写**：前端拿到的每个视图带 `base_version` = 文件内容哈希
 //! （文件不存在 = 0）。任何编辑都要回传它；后端在持锁的读-改-写里重算哈希比对，
-//! 不一致说明磁盘版本已被 pull / 其他端更新 → 拒绝写入（`stale`），前端重新拉视图。
+//! 不一致说明磁盘版本已被 pull / 外部任务更新 → 拒绝写入（`stale`），前端重新拉视图。
 //!
 //! **io 锁**：`读-改-写` 与 git pull（重写工作区文件）互斥，消除竞态窗口。
 //! v1 为正确性优先，锁覆盖整个同步周期（秒级）；同步只在 30min tick / 手动 / 退出发生。
 //!
-//! **仓库硬约束**：不写 `_current.md`（归外部例程维护）、
-//! `#overdue` 只读（不可设置不可清除）。
+//! **仓库硬约束**（同步仓约定）：不写 `_current.md`、不执行外部例行任务、
+//! `#overdue` 只读（PRD D4：不可设置不可清除）。
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
@@ -20,16 +21,18 @@ use std::sync::{Arc, Mutex};
 use chrono::{Datelike, Duration, Local};
 use crate::notebook::{self, NotebookDto};
 use crate::notes;
+use crate::stickies;
 
 use crate::parser::{Category, Flag, Priority, TodoFile};
 use crate::repo::{FileKind, DAY_TASK_SECTION};
 use crate::sched::SchedMsg;
 use crate::sync::{SyncEngine, SyncError};
 
-/// 默认同步仓（占位地址：首次启动请在「同步设置」或 STICKY_REPO_URL 指向你自己的仓库）。
+/// 克隆位置（PRD D3：固定路径，天然可恢复的离线队列）。
 pub const REPO_URL: &str = "https://github.com/your-account/sticky-sync.git";
 
-/// 环境变量覆盖（冒烟测试 / 多机部署用）。
+/// 环境变量覆盖（冒烟测试 / 多机部署用）：未注册 commit 前缀前，
+/// 本地跑真实 UI 必须指向测试仓库，绝不推真实的同步仓。
 pub fn repo_url() -> String {
     std::env::var("STICKY_REPO_URL").unwrap_or_else(|_| REPO_URL.to_string())
 }
@@ -99,6 +102,8 @@ pub enum SyncUiState {
     Offline { unpushed: usize },
     /// rebase 真冲突：本地修改保留，等人工处理（重试 / 打开仓库文件夹）
     Conflict { message: String },
+    /// 冲突已语义自动合并并推送：角标提示一次，不阻塞任何后续流程
+    Merged { files: Vec<String> },
     Error { message: String },
 }
 
@@ -148,6 +153,58 @@ pub struct NotesDto {
     pub kind: String,
     pub date: String,
     pub days: Vec<NotesDayDto>,
+}
+
+fn create_sticky_exclusive(path: &std::path::Path, content: &str) -> Result<(), std::io::Error> {
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    if let Err(error) = file.write_all(content.as_bytes()) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn create_sticky_with_retry(dir: &std::path::Path, content: &str, mut next_id: impl FnMut() -> String) -> Result<String, CmdError> {
+    for _ in 0..16 {
+        let id = next_id();
+        let path = dir.join(format!("{id}.md"));
+        match create_sticky_exclusive(&path, content) {
+            Ok(()) => return Ok(id),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(CmdError::internal(format!("创建便签失败: {e}"))),
+        }
+    }
+    Err(CmdError::internal("创建便签失败，请重试"))
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct StickyDto {
+    pub id: String,
+    pub content: String,
+    #[serde(serialize_with = "u64_str")]
+    pub base_version: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct StickiesDto {
+    pub date: String,
+    pub weekday: String,
+    pub stickies: Vec<StickyDto>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct StickyCreatedDto {
+    pub id: String,
+    #[serde(serialize_with = "u64_str")]
+    pub base_version: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct StickyDeletedDto {
+    #[serde(serialize_with = "u64_str")]
+    pub base_version: u64,
+    pub removed_content: String,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -453,6 +510,94 @@ impl StickyStore {
         Ok(EditResult { base_version: version })
     }
 
+    pub fn list_stickies(&self, notebook: &str, date: chrono::NaiveDate) -> Result<StickiesDto, CmdError> {
+        self.ensure_repo_ready()?;
+        let _g = self.read_scope();
+        let dir = notebook::root(self.engine.repo_dir(), notebook)?.join(stickies::rel_dir(date));
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(StickiesDto { date: crate::repo::fmt_date(date), weekday: notes::weekday_full(date.weekday()).into(), stickies: Vec::new() });
+            }
+            Err(e) => return Err(CmdError::internal(format!("读取便签目录失败: {e}"))),
+        };
+        let mut found = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| CmdError::internal(format!("读取便签目录失败: {e}")))?;
+            if !entry.file_type().map_err(|e| CmdError::internal(format!("读取便签失败: {e}")))?.is_file() { continue; }
+            let name = entry.file_name();
+            let Some(id) = name.to_str().and_then(|s| s.strip_suffix(".md")) else { continue; };
+            if !stickies::valid_id(id) { continue; }
+            let content = std::fs::read_to_string(entry.path())
+                .map_err(|e| CmdError::internal(format!("读取便签失败: {e}")))?;
+            found.push(StickyDto { id: id.into(), base_version: hash_text(&content), content });
+        }
+        found.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(StickiesDto { date: crate::repo::fmt_date(date), weekday: notes::weekday_full(date.weekday()).into(), stickies: found })
+    }
+
+    pub fn add_sticky(&self, notebook: &str, date: chrono::NaiveDate, content: &str) -> Result<StickyCreatedDto, CmdError> {
+        let content = notes::validate_and_normalize(content).map_err(CmdError::bad_request)?;
+        let _g = self.io_lock();
+        self.ensure_repo_ready()?;
+        let dir = notebook::root(self.engine.repo_dir(), notebook)?.join(stickies::rel_dir(date));
+        std::fs::create_dir_all(&dir).map_err(|e| CmdError::internal(format!("创建便签目录失败: {e}")))?;
+        let id = create_sticky_with_retry(&dir, &content, stickies::new_id)?;
+        self.pending_edits.fetch_add(1, Ordering::Relaxed);
+        Ok(StickyCreatedDto { id, base_version: hash_text(&content) })
+    }
+
+    pub fn save_sticky(&self, notebook: &str, date: chrono::NaiveDate, id: &str, content: &str, base_version: u64) -> Result<EditResult, CmdError> {
+        let content = notes::validate_and_normalize(content).map_err(CmdError::bad_request)?;
+        if !stickies::valid_id(id) { return Err(CmdError::bad_request("无效的便签 ID")); }
+        let _g = self.io_lock();
+        self.ensure_repo_ready()?;
+        let path = notebook::root(self.engine.repo_dir(), notebook)?.join(stickies::rel_path(date, id));
+        let current = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(CmdError { code: "stale", message: "便签已不存在，请刷新后重试".into() }),
+            Err(e) => return Err(CmdError::internal(format!("读取便签失败: {e}"))),
+        };
+        if hash_text(&current) != base_version { return Err(CmdError::stale()); }
+        notebook::atomic_write(&path, &content)?;
+        self.pending_edits.fetch_add(1, Ordering::Relaxed);
+        Ok(EditResult { base_version: hash_text(&content) })
+    }
+
+    pub fn delete_sticky(&self, notebook: &str, date: chrono::NaiveDate, id: &str, base_version: u64) -> Result<StickyDeletedDto, CmdError> {
+        if !stickies::valid_id(id) { return Err(CmdError::bad_request("无效的便签 ID")); }
+        let _g = self.io_lock();
+        self.ensure_repo_ready()?;
+        let path = notebook::root(self.engine.repo_dir(), notebook)?.join(stickies::rel_path(date, id));
+        let content = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(CmdError { code: "stale", message: "便签已不存在，请刷新后重试".into() }),
+            Err(e) => return Err(CmdError::internal(format!("读取便签失败: {e}"))),
+        };
+        if hash_text(&content) != base_version { return Err(CmdError::stale()); }
+        std::fs::remove_file(&path).map_err(|e| CmdError::internal(format!("删除便签失败: {e}")))?;
+        self.pending_edits.fetch_add(1, Ordering::Relaxed);
+        Ok(StickyDeletedDto { base_version, removed_content: content })
+    }
+
+    pub fn restore_sticky(&self, notebook: &str, date: chrono::NaiveDate, id: &str, content: &str) -> Result<EditResult, CmdError> {
+        let content = notes::validate_and_normalize(content).map_err(CmdError::bad_request)?;
+        if !stickies::valid_id(id) { return Err(CmdError::bad_request("无效的便签 ID")); }
+        let _g = self.io_lock();
+        self.ensure_repo_ready()?;
+        let path = notebook::root(self.engine.repo_dir(), notebook)?.join(stickies::rel_path(date, id));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| CmdError::internal(format!("创建便签目录失败: {e}")))?;
+        }
+        match create_sticky_exclusive(&path, &content) {
+            Ok(()) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(CmdError { code: "stale", message: "便签已存在，无法撤销恢复".into() }),
+            Err(e) => return Err(CmdError::internal(format!("恢复便签失败: {e}"))),
+        }
+        self.pending_edits.fetch_add(1, Ordering::Relaxed);
+        Ok(EditResult { base_version: hash_text(&content) })
+    }
+
     /// 核心：持锁读-改-写 + base_version 校验 + pending_edits 计数（供 commit message 汇总）。
     fn edit<F>(&self, notebook: &str, kind: &FileKind, base_version: u64, f: F) -> Result<u64, CmdError>
     where
@@ -579,7 +724,7 @@ impl StickyStore {
         base_version: u64,
     ) -> Result<EditResult, CmdError> {
         if flag == Flag::Overdue {
-            return Err(CmdError::bad_request("#overdue 只读：由外部例程维护"));
+            return Err(CmdError::bad_request("#overdue 只读：由外部例行任务维护"));
         }
         let now = Self::unix_now();
         let bv = self.edit(notebook, kind, base_version, move |f| {
@@ -764,7 +909,7 @@ impl StickyStore {
         }
         let root = self.engine.repo_dir();
         let mut out = Vec::new();
-        for dir in ["days", "weeks", "notes", "notebooks"] { visit(root, &root.join(dir), &mut out); }
+        for dir in ["days", "weeks", "notes", "stickies", "notebooks"] { visit(root, &root.join(dir), &mut out); }
         out.sort();
         out
     }
@@ -830,3 +975,98 @@ pub fn parse_status(word: &str) -> Result<crate::parser::TaskStatus, CmdError> {
 
 /// Tauri 管理的状态句柄。
 pub type StoreState = Arc<StickyStore>;
+
+#[cfg(test)]
+mod sticky_tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    fn setup() -> (tempfile::TempDir, StickyStore, NaiveDate) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StickyStore::new(dir.path());
+        store.mark_repo_ready();
+        (dir, store, NaiveDate::from_ymd_opt(2024, 9, 30).unwrap())
+    }
+
+    #[test]
+    fn exclusive_creation_retries_a_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = "1727687133123-3fa2b91c";
+        let second = "1727687133123-3fa2b91d";
+        std::fs::write(dir.path().join(format!("{first}.md")), "original").unwrap();
+        let mut ids = [first, second].into_iter();
+        let id = create_sticky_with_retry(dir.path(), "new", || ids.next().unwrap().into()).unwrap();
+        assert_eq!(id, second);
+        assert_eq!(std::fs::read_to_string(dir.path().join(format!("{first}.md"))).unwrap(), "original");
+        assert_eq!(std::fs::read_to_string(dir.path().join(format!("{second}.md"))).unwrap(), "new");
+    }
+
+    #[test]
+    fn add_save_list_multiline_and_empty_roundtrip() {
+        let (_dir, store, day) = setup();
+        assert_ne!(hash_text(""), 0);
+        let empty = store.add_sticky("default", day, "").unwrap();
+        assert_eq!(empty.base_version, hash_text(""));
+        let made = store.add_sticky("default", day, "a\r\nb").unwrap();
+        let list = store.list_stickies("default", day).unwrap();
+        assert_eq!(list.stickies.len(), 2);
+        assert_eq!(list.date, "2024-09-30");
+        assert_eq!(list.weekday, "周一");
+        assert_eq!(list.stickies.iter().find(|s| s.id == made.id).unwrap().content, "a\nb");
+        let saved = store.save_sticky("default", day, &made.id, "new\nline", made.base_version).unwrap();
+        let listed = store.list_stickies("default", day).unwrap();
+        assert_eq!(listed.stickies.iter().find(|s| s.id == made.id).unwrap().base_version, saved.base_version);
+        assert_eq!(store.take_pending_edits(), 3);
+        assert!(listed.stickies.windows(2).all(|w| w[0].id <= w[1].id));
+    }
+
+    #[test]
+    fn stale_save_and_missing_file_are_rejected() {
+        let (_dir, store, day) = setup();
+        let made = store.add_sticky("default", day, "one").unwrap();
+        store.save_sticky("default", day, &made.id, "two", made.base_version).unwrap();
+        assert_eq!(store.save_sticky("default", day, &made.id, "three", made.base_version).unwrap_err().code, "stale");
+        std::fs::remove_file(store.engine.repo_dir().join(stickies::rel_path(day, &made.id))).unwrap();
+        let error = store.save_sticky("default", day, &made.id, "three", hash_text("two")).unwrap_err();
+        assert_eq!(error.code, "stale");
+        assert!(error.message.contains("已不存在"));
+    }
+
+    #[test]
+    fn delete_restore_roundtrip_and_existing_restore_is_stale() {
+        let (_dir, store, day) = setup();
+        let made = store.add_sticky("default", day, "old\ntext").unwrap();
+        let removed = store.delete_sticky("default", day, &made.id, made.base_version).unwrap();
+        assert_eq!(removed.removed_content, "old\ntext");
+        assert!(store.list_stickies("default", day).unwrap().stickies.is_empty());
+        let restored = store.restore_sticky("default", day, &made.id, &removed.removed_content).unwrap();
+        assert_eq!(restored.base_version, made.base_version);
+        let error = store.restore_sticky("default", day, &made.id, "replacement").unwrap_err();
+        assert_eq!(error.code, "stale");
+        assert_eq!(error.message, "便签已存在，无法撤销恢复");
+        assert_eq!(store.take_pending_edits(), 3);
+    }
+
+    #[test]
+    fn invalid_ids_are_bad_requests() {
+        let (_dir, store, day) = setup();
+        for id in ["../x", "1727687133123-3FA2B91C", "172768713312-3fa2b91c"] {
+            assert_eq!(store.save_sticky("default", day, id, "", 0).unwrap_err().code, "bad_request");
+            assert_eq!(store.delete_sticky("default", day, id, 0).unwrap_err().code, "bad_request");
+            assert_eq!(store.restore_sticky("default", day, id, "").unwrap_err().code, "bad_request");
+        }
+    }
+
+    #[test]
+    fn watched_fingerprints_include_default_and_notebook_stickies() {
+        let (dir, store, day) = setup();
+        let before = store.watched_fingerprints(day);
+        let first = store.add_sticky("default", day, "default").unwrap();
+        let book = notebook::save(dir.path(), None, "测试", 0).unwrap();
+        let second = store.add_sticky(&book.id, day, "notebook").unwrap();
+        let after = store.watched_fingerprints(day);
+        assert_ne!(before, after);
+        assert!(after.iter().any(|(p, _)| p.replace('\\', "/") == stickies::rel_path(day, &first.id)));
+        assert!(after.iter().any(|(p, _)| p.replace('\\', "/") == format!("notebooks/{}/{}", book.id, stickies::rel_path(day, &second.id))));
+    }
+}

@@ -356,7 +356,7 @@ function renderOverdueSum(root: HTMLElement, tasks: TaskView[]): void {
   sum.hidden = false;
   sum.replaceChildren();
   const span = el("span", undefined, `${n} 项标注了 #overdue`);
-  const note = el("span", "sum-note", "（只读）");
+  const note = el("span", "sum-note", "（只读，由外部任务维护）");
   sum.append(span, note);
 }
 
@@ -494,6 +494,10 @@ export function renderSync(root: HTMLElement, s: SyncState | null): void {
     case "conflict":
       text.textContent = "冲突：需人工处理";
       text.title = s.message;
+      break;
+    case "merged":
+      text.textContent = `已自动合并 · ${s.files.length} 文件`;
+      text.title = s.files.join("\n");
       break;
     case "error":
       text.textContent = "同步异常";

@@ -20,8 +20,10 @@ macro_rules! log_err {
     }};
 }
 
+pub mod merge_resolve;
 pub mod notebook;
 pub mod notes;
+pub mod stickies;
 pub mod parser;
 #[cfg(windows)]
 pub mod placement;
@@ -35,6 +37,7 @@ pub mod store;
 pub mod sync;
 mod sync_config;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,6 +47,125 @@ use store::{CmdError, StoreState, StickyStore};
 
 /// 贴纸窗口逻辑宽度（设计方案 §2 布局；tauri.conf.json 同步）。
 const STICKY_W: f64 = 372.0;
+// Physical pixels throughout, matching Tauri's window and monitor geometry APIs.
+static BOARD_WINDOW_ZOOMED: AtomicBool = AtomicBool::new(false);
+
+fn board_editor_rect(area: tauri::PhysicalRect<i32, u32>) -> tauri::PhysicalRect<i32, u32> {
+    const MARGIN: u32 = 28;
+    let max_width = ((f64::from(area.size.width) * 0.96).round() as u32).min(area.size.width);
+    let margin = MARGIN.min(max_width / 2).min(area.size.height / 2);
+    let max_paper_width = max_width - 2 * margin;
+    let max_paper_height = area.size.height - 2 * margin;
+    let paper_height = ((f64::from(area.size.height) * 0.88).round() as u32)
+        .min(max_paper_height)
+        .min(max_paper_width.saturating_mul(297) / 210);
+    let paper_width = (f64::from(paper_height) * 210.0 / 297.0).round() as u32;
+    let width = paper_width + 2 * margin;
+    let height = paper_height + 2 * margin;
+    tauri::PhysicalRect {
+        position: tauri::PhysicalPosition::new(
+            i64::from(area.position.x).saturating_add(i64::from(area.size.width - width) / 2) as i32,
+            i64::from(area.position.y).saturating_add(i64::from(area.size.height - height) / 2) as i32,
+        ),
+        size: tauri::PhysicalSize::new(width, height),
+    }
+}
+
+fn resized_board_editor_rect(
+    area: tauri::PhysicalRect<i32, u32>,
+    current: tauri::PhysicalRect<i32, u32>,
+    requested_paper_width: u32,
+) -> tauri::PhysicalRect<i32, u32> {
+    const MARGIN: u32 = 28;
+    let max_width = area.size.width.saturating_sub(2 * MARGIN).min(
+        area.size.height.saturating_sub(2 * MARGIN).saturating_mul(210) / 297,
+    );
+    let paper_width = requested_paper_width.max(340.min(max_width)).min(max_width);
+    let width = paper_width + 2 * MARGIN;
+    let height = ((f64::from(paper_width) * 297.0 / 210.0).round() as u32) + 2 * MARGIN;
+    let center_x = i64::from(current.position.x) + i64::from(current.size.width / 2);
+    let center_y = i64::from(current.position.y) + i64::from(current.size.height / 2);
+    let x = (center_x - i64::from(width / 2))
+        .clamp(i64::from(area.position.x), i64::from(area.position.x) + i64::from(area.size.width.saturating_sub(width)));
+    let y = (center_y - i64::from(height / 2))
+        .clamp(i64::from(area.position.y), i64::from(area.position.y) + i64::from(area.size.height.saturating_sub(height)));
+    tauri::PhysicalRect {
+        position: tauri::PhysicalPosition::new(x as i32, y as i32),
+        size: tauri::PhysicalSize::new(width, height),
+    }
+}
+
+#[tauri::command]
+fn resize_board_editor(width: f64, app: tauri::AppHandle) -> Result<(), CmdError> {
+    if !width.is_finite() || width <= 0.0 {
+        return Err(CmdError::bad_request("invalid board editor width"));
+    }
+    let editor = app.get_webview_window("board-editor")
+        .ok_or_else(|| CmdError::internal("board-editor window does not exist"))?;
+    let monitor = editor.current_monitor()
+        .map_err(|e| CmdError::internal(format!("read monitor failed: {e}")))?
+        .ok_or_else(|| CmdError::internal("current monitor does not exist"))?;
+    let current = tauri::PhysicalRect {
+        position: editor.outer_position()
+            .map_err(|e| CmdError::internal(format!("read board editor position failed: {e}")))?,
+        size: editor.outer_size()
+            .map_err(|e| CmdError::internal(format!("read board editor size failed: {e}")))?,
+    };
+    let scale = editor.scale_factor()
+        .map_err(|e| CmdError::internal(format!("read board editor scale failed: {e}")))?;
+    let rect = resized_board_editor_rect(*monitor.work_area(), current, (width * scale).round() as u32);
+    editor.set_size(rect.size)
+        .map_err(|e| CmdError::internal(format!("resize board editor failed: {e}")))?;
+    editor.set_position(rect.position)
+        .map_err(|e| CmdError::internal(format!("position board editor failed: {e}")))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod board_editor_rect_tests {
+    use super::{board_editor_rect, resized_board_editor_rect};
+    use tauri::{PhysicalPosition, PhysicalRect, PhysicalSize};
+
+    #[test]
+    fn centers_a4_paper_with_shadow_margin_in_offset_work_area() {
+        let area = PhysicalRect {
+            position: PhysicalPosition::new(-1920, 40),
+            size: PhysicalSize::new(1920, 1040),
+        };
+        let rect = board_editor_rect(area);
+        assert_eq!(rect.size, PhysicalSize::new(703, 971));
+        assert_eq!(rect.position, PhysicalPosition::new(-1312, 74));
+        assert_eq!(rect.size.height - 56, 915);
+        assert_eq!(rect.size.width - 56, 647);
+    }
+
+    #[test]
+    fn clamps_small_work_area_width_and_keeps_window_inside_it() {
+        let area = PhysicalRect {
+            position: PhysicalPosition::new(2200, -300),
+            size: PhysicalSize::new(640, 900),
+        };
+        let rect = board_editor_rect(area);
+        assert!(rect.size.width <= 614);
+        assert!(rect.size.height <= area.size.height);
+        assert_eq!(rect.position.x, area.position.x + (640 - rect.size.width as i32) / 2);
+        assert_eq!(rect.position.y, area.position.y + (900 - rect.size.height as i32) / 2);
+        assert!((f64::from(rect.size.width - 56) / f64::from(rect.size.height - 56)
+            - 210.0 / 297.0).abs() < 0.002);
+    }
+
+    #[test]
+    fn resized_paper_keeps_a4_ratio_and_clamps_to_offset_work_area() {
+        let area = PhysicalRect { position: PhysicalPosition::new(-1920, 40), size: PhysicalSize::new(1200, 900) };
+        let current = PhysicalRect { position: PhysicalPosition::new(-900, 700), size: PhysicalSize::new(600, 800) };
+        let rect = resized_board_editor_rect(area, current, 800);
+        assert!(rect.position.x >= area.position.x);
+        assert!(rect.position.y >= area.position.y);
+        assert!(rect.position.x + rect.size.width as i32 <= area.position.x + area.size.width as i32);
+        assert!(rect.position.y + rect.size.height as i32 <= area.position.y + area.size.height as i32);
+        assert!((f64::from(rect.size.width - 56) / f64::from(rect.size.height - 56) - 210.0 / 297.0).abs() < 0.002);
+    }
+}
 
 /// 命令层视图解析：day/week 按 date 定位日期及所属周，None/空 = 今天。
 fn view_kind(word: &str, date: Option<&str>) -> Result<repo::FileKind, CmdError> {
@@ -117,6 +239,95 @@ fn save_note(
         return Err(CmdError::bad_request("应为日速记"));
     };
     state.save_note(&notebook_id, day, &content, parse_bv(&base_version)?)
+}
+
+// async command：WebviewWindowBuilder::build() 在 Windows 上需回主事件循环初始化
+// WebView；sync command 线程阻塞等待会与主线程互等死锁（invoke 永久 pending）。
+#[tauri::command]
+async fn set_board_window(zoomed: bool, app: tauri::AppHandle) -> Result<(), CmdError> {
+    if zoomed {
+        let sticky = app
+            .get_webview_window("sticky")
+            .ok_or_else(|| CmdError::internal("sticky window does not exist"))?;
+        let monitor = sticky.current_monitor()
+            .map_err(|e| CmdError::internal(format!("read monitor failed: {e}")))?
+            .ok_or_else(|| CmdError::internal("current monitor does not exist"))?;
+        let rect = board_editor_rect(*monitor.work_area());
+        let editor = if let Some(editor) = app.get_webview_window("board-editor") {
+            editor
+        } else {
+            // 同进程第二个 WebView2 Environment 若与首窗的 browser arguments 不一致,
+            // 控制器创建报 0x8007139F ERROR_INVALID_STATE——必须复用 sticky 的参数。
+            let browser_args = app.config().app.windows.iter()
+                .find(|w| w.label == "sticky")
+                .and_then(|w| w.additional_browser_args.clone())
+                .unwrap_or_default();
+            tauri::WebviewWindowBuilder::new(&app, "board-editor",
+                    tauri::WebviewUrl::App("index.html#/board-editor".into()))
+                .title("日課·便签")
+                .additional_browser_args(&browser_args)
+                .inner_size(f64::from(rect.size.width) / monitor.scale_factor(),
+                            f64::from(rect.size.height) / monitor.scale_factor())
+                .position(f64::from(rect.position.x) / monitor.scale_factor(),
+                          f64::from(rect.position.y) / monitor.scale_factor())
+                .decorations(false)
+                .transparent(true)
+                .shadow(false)
+                .resizable(false)
+                .skip_taskbar(true)
+                .visible(true)
+                .build()
+                .map_err(|e| CmdError::internal(format!("create board-editor window failed: {e}")))?
+        };
+        editor.set_size(rect.size)
+            .map_err(|e| CmdError::internal(format!("resize board-editor window failed: {e}")))?;
+        editor.set_position(rect.position)
+            .map_err(|e| CmdError::internal(format!("center board window failed: {e}")))?;
+        editor.show()
+            .map_err(|e| CmdError::internal(format!("show board-editor window failed: {e}")))?;
+        BOARD_WINDOW_ZOOMED.store(true, Ordering::SeqCst);
+        editor.set_focus()
+            .map_err(|e| CmdError::internal(format!("focus board-editor window failed: {e}")))?;
+    } else {
+        if let Some(editor) = app.get_webview_window("board-editor") {
+            editor.hide()
+                .map_err(|e| CmdError::internal(format!("hide board-editor window failed: {e}")))?;
+        }
+        BOARD_WINDOW_ZOOMED.store(false, Ordering::SeqCst);
+    }
+    Ok(())
+}
+
+fn sticky_day(date: Option<&str>) -> Result<chrono::NaiveDate, CmdError> {
+    let repo::FileKind::Day(day) = store::resolve_kind("day", date)? else {
+        return Err(CmdError::bad_request("应为日期"));
+    };
+    Ok(day)
+}
+
+#[tauri::command]
+fn list_stickies(notebook_id: String, date: Option<String>, state: tauri::State<StoreState>) -> Result<store::StickiesDto, CmdError> {
+    state.list_stickies(&notebook_id, sticky_day(date.as_deref())?)
+}
+
+#[tauri::command]
+fn add_sticky(notebook_id: String, date: Option<String>, content: String, state: tauri::State<StoreState>) -> Result<store::StickyCreatedDto, CmdError> {
+    state.add_sticky(&notebook_id, sticky_day(date.as_deref())?, &content)
+}
+
+#[tauri::command]
+fn save_sticky(notebook_id: String, date: Option<String>, id: String, content: String, base_version: String, state: tauri::State<StoreState>) -> Result<store::EditResult, CmdError> {
+    state.save_sticky(&notebook_id, sticky_day(date.as_deref())?, &id, &content, parse_bv(&base_version)?)
+}
+
+#[tauri::command]
+fn delete_sticky(notebook_id: String, date: Option<String>, id: String, base_version: String, state: tauri::State<StoreState>) -> Result<store::StickyDeletedDto, CmdError> {
+    state.delete_sticky(&notebook_id, sticky_day(date.as_deref())?, &id, parse_bv(&base_version)?)
+}
+
+#[tauri::command]
+fn restore_sticky(notebook_id: String, date: Option<String>, id: String, content: String, state: tauri::State<StoreState>) -> Result<store::EditResult, CmdError> {
+    state.restore_sticky(&notebook_id, sticky_day(date.as_deref())?, &id, &content)
 }
 
 #[tauri::command]
@@ -329,7 +540,7 @@ fn sync_status(state: tauri::State<StoreState>) -> store::SyncUiState {
     state.status()
 }
 
-/// 本机提交身份（页脚右下角展示，如 sticky@office）。
+/// 本机提交身份（页脚右下角展示，如 sticky@<machine>）。
 #[tauri::command]
 fn machine_tag() -> String {
     crate::sync::machine_tag()
@@ -380,6 +591,25 @@ fn register_hotkey(app: &tauri::App) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // tauri-runtime-wry 建窗/建 WebView 失败只走 log::error!，不装 logger 会静默吞错
+    //（曾致 board-editor 窗口建不出来且无任何报错）——Error 级打到 stderr 以便排查。
+    #[cfg(desktop)]
+    {
+        struct StderrLog;
+        impl log::Log for StderrLog {
+            fn enabled(&self, _: &log::Metadata) -> bool { true }
+            // eprintln! 在 stderr 写失败（GUI 启动无有效句柄）时按 std 语义 panic，
+            // 恰好炸在建窗失败现场——改 writeln! 并忽略错误。
+            fn log(&self, r: &log::Record) {
+                use std::io::Write;
+                let _ = writeln!(std::io::stderr(), "[log:{}] {}", r.level(), r.args());
+            }
+            fn flush(&self) {}
+        }
+        static LOGGER: StderrLog = StderrLog;
+        let _ = log::set_logger(&LOGGER);
+        log::set_max_level(log::LevelFilter::Error);
+    }
     #[cfg(target_os = "android")]
     android_logger::init_once(
         android_logger::Config::default()
@@ -398,6 +628,12 @@ pub fn run() {
             get_view,
             get_notes,
             save_note,
+            // 便签本
+            list_stickies,
+            add_sticky,
+            save_sticky,
+            delete_sticky,
+            restore_sticky,
             get_yesterday_leftovers,
             copy_leftover_to_today,
             set_checked,
@@ -416,12 +652,30 @@ pub fn run() {
             sync_status,
             machine_tag,
             shell_sink,
-            set_body_height
+            set_body_height,
+            set_board_window,
+            resize_board_editor
         ])
         // 拖动落定：Moved 只记账，placement 监视线程防抖后吸附+落盘
         .on_window_event(|window, event| {
+            if window.label() == "board-editor" {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    use tauri::Emitter;
+                    api.prevent_close();
+                    if let Err(error) = window.hide() {
+                        log_err!("hide board-editor window failed: {error}");
+                    } else {
+                        BOARD_WINDOW_ZOOMED.store(false, Ordering::SeqCst);
+                        if let Some(sticky) = window.app_handle().get_webview_window("sticky") {
+                            if let Err(error) = sticky.emit("board-editor-dismissed", serde_json::json!({})) {
+                                log_err!("emit board-editor-dismissed failed: {error}");
+                            }
+                        }
+                    }
+                }
+            }
             if let tauri::WindowEvent::Moved(_) = event {
-                if window.label() == "sticky" {
+                if window.label() == "sticky" && !BOARD_WINDOW_ZOOMED.load(Ordering::SeqCst) {
                     #[cfg(windows)]
                     if let Ok(h) = window.hwnd() {
                         placement::note_moved(h.0);

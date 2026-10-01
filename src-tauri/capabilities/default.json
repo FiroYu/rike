@@ -1,8 +1,11 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window",
-  "windows": ["sticky"],
+  "description": "Capability for the main window and board editor window",
+  "windows": [
+    "sticky",
+    "board-editor"
+  ],
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging"

@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.8.6"
+version = "0.9.3"
 description = "rike — desktop sticky todo with git sync"
 authors = ["FiroYu"]
 license = "MIT"

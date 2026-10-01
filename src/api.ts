@@ -8,6 +8,8 @@ export type TaskStatus = "todo" | "doing" | "paused" | "done";
 
 export interface NoteDayDto { date: string; weekday: string; content: string; base_version: string }
 export interface NotesDto { kind: ViewKind; date: string; days: NoteDayDto[] }
+export interface StickyDto { id: string; content: string; base_version: string }
+export interface StickiesDto { date: string; weekday: string; stickies: StickyDto[] }
 
 export interface Notebook { id: string; name: string; base_version: string }
 export interface TaskSource { kind: ViewKind; date: string; rel_path: string; base_version: string }
@@ -76,6 +78,7 @@ export type SyncState =
   | { kind: "syncing" }
   | { kind: "offline"; unpushed: number }
   | { kind: "conflict"; message: string }
+  | { kind: "merged"; files: string[] }
   | { kind: "error"; message: string };
 
 export class ApiError extends Error {
@@ -107,6 +110,16 @@ export const api = {
     call<NotesDto>("get_notes", { notebookId, kind, date }),
   saveNote: (notebookId: string, date: string, content: string, baseVersion: string) =>
     call<{ base_version: string }>("save_note", { notebookId, date, content, baseVersion }),
+  listSticky: (notebookId: string, date?: string) =>
+    call<StickiesDto>("list_stickies", { notebookId, date }),
+  addSticky: (notebookId: string, date: string, content: string) =>
+    call<{ id: string; base_version: string }>("add_sticky", { notebookId, date, content }),
+  saveSticky: (notebookId: string, date: string, id: string, content: string, baseVersion: string) =>
+    call<{ base_version: string }>("save_sticky", { notebookId, date, id, content, baseVersion }),
+  deleteSticky: (notebookId: string, date: string, id: string, baseVersion: string) =>
+    call<{ base_version: string; removed_content: string }>("delete_sticky", { notebookId, date, id, baseVersion }),
+  restoreSticky: (notebookId: string, date: string, id: string, content: string) =>
+    call<{ base_version: string }>("restore_sticky", { notebookId, date, id, content }),
   listNotebooks: () => call<Notebook[]>("list_notebooks"),
   createNotebook: (name: string) => call<Notebook>("create_notebook", { name }),
   renameNotebook: (notebookId: string, name: string, baseVersion: string) =>
@@ -194,4 +207,6 @@ export const api = {
   machineTag: () => call<string>("machine_tag"),
   shellSink: () => call<null>("shell_sink"),
   setBodyHeight: (height: number) => call<null>("set_body_height", { height }),
+  setBoardWindow: (zoomed: boolean) => call<void>("set_board_window", { zoomed }),
+  resizeBoardEditor: (width: number) => call<void>("resize_board_editor", { width }),
 };

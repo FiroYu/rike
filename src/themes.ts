@@ -6,8 +6,6 @@ const isWindows = /Windows NT/.test(navigator.userAgent);
 const themes = ([
   { id: "glass", name: "毛玻璃", paper: "#e9edf4", ink: "#16181a", detail: "玻璃 · 透桌面" },
   { id: "classic", name: "极简黑标", paper: "#f4f3f0", ink: "#16181a", detail: "素纸 · 黑墨" },
-  { id: "midnight", name: "午夜墨蓝", paper: "#1d2837", ink: "#edf1f7", detail: "深色纸 · 银墨" },
-  { id: "mist", name: "雾蓝点阵", paper: "#edf3f8", ink: "#355571", detail: "点阵纸 · 雾蓝" },
 ] as const).filter((t) => isWindows || t.id !== "glass");
 
 const storageKey = "sticky-todo.theme";

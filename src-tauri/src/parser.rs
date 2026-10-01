@@ -1057,6 +1057,299 @@ impl TodoFile {
     }
 }
 
+/// 冲突自动合并（v0.8.6）的行级结果：合并后的原始行 + 裁决注记（进 meta.json）。
+/// 任务身份键：内容主体（merge_resolve 三方配对用；不含优先级/分类——
+/// 那些是可仲裁属性，进键会让单侧调档拆成两个任务、丢掉对端勾选）。
+pub(crate) fn task_identity(line: &str) -> Option<String> {
+    parse_task_line(line).map(|p| p.content)
+}
+
+pub(crate) struct MergedTaskLine {
+    pub line: String,
+    pub notes: Vec<String>,
+}
+
+/// 任务行三方语义合并。三方须为「同一任务」的三个版本（调用方 merge_resolve
+/// 按身份键＝内容＋子行配对，见 merge_resolve 模块注释）。
+///
+/// 快路径：任两方字节相等 → 直接取第三方原文（零手术、字节保真）。
+/// 双改路径以 ours 原始行为底做字节区间手术（保 #overdue/#blocked 原因与
+/// 人工注记的原文），属性裁决全部朝「不丢」方向：
+/// - checked 或运算；状态三方裁决（单侧改动取动侧，双改取更高进度
+///   Done > Doing > Paused > Todo，doing 优先于 paused）
+/// - `#t` 取 max（TIMER_CAP 已在派生时封顶）；`#ts` 仅 Doing 保留（ours 优先）
+/// - 优先级/分类标准三方，双改不同取 ours + note
+/// - 内容主体（content）双改且不同 → None（真冲突，交人工）
+/// - theirs 独有的用户文本（注记尾段、受阻原因分歧）并入行尾，不丢记录
+pub(crate) fn three_way_merge_task_line(
+    base: Option<&str>,
+    ours: &str,
+    theirs: &str,
+) -> Option<MergedTaskLine> {
+    // 快路径：字节比较零成本且免解析
+    if ours == theirs {
+        return Some(MergedTaskLine { line: ours.to_string(), notes: Vec::new() });
+    }
+    let bp = match base {
+        None => None, // add/add：双端各自新建的同键任务，无 base 参照
+        Some(b) => {
+            if b == theirs {
+                return Some(MergedTaskLine { line: ours.to_string(), notes: Vec::new() });
+            }
+            if b == ours {
+                return Some(MergedTaskLine { line: theirs.to_string(), notes: Vec::new() });
+            }
+            Some(parse_task_line(b)?) // base 行不是任务行 → 无法配对
+        }
+    };
+
+    let op = parse_task_line(ours)?;
+    let tp = parse_task_line(theirs)?;
+    // 内容主体双改且不同：同一任务的文案被两端改成两个方向 → 人工
+    if op.content != tp.content {
+        if bp.as_ref().is_some_and(|bp| bp.content == op.content) {
+            return Some(MergedTaskLine { line: theirs.to_string(), notes: Vec::new() });
+        }
+        if bp.as_ref().is_some_and(|bp| bp.content == tp.content) {
+            return Some(MergedTaskLine { line: ours.to_string(), notes: Vec::new() });
+        }
+        return None;
+    }
+
+    let mut notes: Vec<String> = Vec::new();
+
+    // ── 目标属性裁决 ──────────────────────────────────────────────
+    // checked 标准三方：单侧改动取动侧（本机复活 Done→Paused 不会被对端的
+    // 陈旧勾选翻回），双改取或运算
+    let checked = match bp.as_ref() {
+        Some(bp) if tp.checked == bp.checked => op.checked,
+        Some(bp) if op.checked == bp.checked => tp.checked,
+        _ => op.checked || tp.checked,
+    };
+    let status = match bp.as_ref() {
+        Some(bp) => three_way_status(bp.status, op.status, tp.status),
+        None => max_status(op.status, tp.status),
+    };
+    let timer = op.timer_base.max(tp.timer_base);
+    let ts = if status == TaskStatus::Doing {
+        op.timer_started_at.or(tp.timer_started_at)
+    } else {
+        None
+    };
+    if op.timer_invalid || tp.timer_invalid {
+        notes.push("计时标签存在非法值，按现值取 max 合并".into());
+    }
+    // 优先级/分类：标准三方（单侧改动取动侧，双改取 ours）
+    let prio = match (bp.as_ref().and_then(|bp| bp.priority), op.priority, tp.priority) {
+        (_, o, t) if o == t => o,
+        (b, _, t) if b == t => op.priority, // ours 是动侧
+        (b, o, t) if b == o => t,           // theirs 是动侧
+        _ => {
+            notes.push(format!(
+                "优先级双端改动不同（本机 {:?} / 对端 {:?}），取本机",
+                op.priority, tp.priority
+            ));
+            op.priority
+        }
+    };
+    let cat = match (
+        bp.as_ref().map(|bp| bp.category).unwrap_or(Category::Uncategorized),
+        op.category,
+        tp.category,
+    ) {
+        (_, o, t) if o == t => o,
+        (b, _, t) if b == t => op.category,
+        (b, o, t) if b == o => t,
+        _ => {
+            notes.push("分类双端改动不同，取本机".into());
+            op.category
+        }
+    };
+
+    // ── 以 ours 原始行为底的区间手术 ─────────────────────────────
+    let b = ours.as_bytes();
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+
+    // 1) 状态标签手术（#doing/#paused/#t/#ts；重复 token 全清，手法同 set_status_at）。
+    //    #overdue/#blocked 与注记文本区间保留原文。
+    // 2) 追加段 tail：#t（离开 Todo 即必有）+ 状态标签 + theirs 加侧胜标签。
+    //    tail 在 ours 的首个状态标签处「原位替换」而非行尾追加——注记只在标签
+    //    之后的空隙存在，行尾追加会把注记挤到新标签之前、被 content 吞掉
+    //    （identity 键漂移）。无状态标签可替换时才退化为行尾追加。
+    let mut tail = String::new();
+    if timer > 0 {
+        // 最小形式：#t 0 是语义空值，不落盘（仅计时标签的历史行按 Paused
+        // 解读，#paused 标签本身已足以派生同态）
+        tail.push_str(&format!(" #t {timer}"));
+    }
+    match status {
+        TaskStatus::Doing => {
+            tail.push_str(" #doing");
+            if let Some(ts) = ts {
+                tail.push_str(&format!(" #ts {ts}"));
+            }
+        }
+        TaskStatus::Paused => tail.push_str(" #paused"),
+        TaskStatus::Done => {}
+        TaskStatus::Todo => {}
+    }
+    // 标签加侧胜（对端新增且 base 没有）才补写；base 有而本机已清除的，
+    // 不因对端陈旧副本而复活（单侧删除应生效）
+    let base_overdue = bp.as_ref().is_some_and(|bp| bp.overdue);
+    if !op.overdue && tp.overdue && !base_overdue {
+        tail.push_str(" #overdue");
+    }
+    if op.overdue && !tp.overdue && base_overdue {
+        notes.push("对端已移除 #overdue，本机保留".into());
+    }
+
+    // theirs 用户文本无损写入：注记尾段与受阻原因分歧落到行尾（写进
+    // 仓库文件本身；备份/meta.json 会被修剪，不能作为用户文本的归宿）。
+    // 追加一律以 " #" 起头：#blocked 原因词的区间贪婪扫到下一个 " #" 或
+    // 行尾，直接拼在行尾会被下次解析吞进受阻原因。
+    let mut extra = String::new();
+    let ann_of = |p: &ParsedLine| {
+        p.display.strip_prefix(&p.content).unwrap_or("").trim().to_string()
+    };
+    let (o_ann, t_ann) = (ann_of(&op), ann_of(&tp));
+    if t_ann != o_ann && !t_ann.is_empty() {
+        extra.push_str(&format!(" # {t_ann}"));
+        notes.push(format!("对端注记「{t_ann}」已并入行尾"));
+    }
+    let base_blocked = bp.as_ref().and_then(|bp| bp.blocked_reason.clone());
+    match (op.blocked_reason.as_deref(), tp.blocked_reason.as_deref()) {
+        (None, Some(r)) if base_blocked.is_none() => {
+            tail.push_str(&format!(" #blocked {r}"));
+        }
+        (Some(_), Some(t)) if Some(t) != base_blocked.as_deref() => {
+            extra.push_str(&format!(" # 对端受阻原因：{t}"));
+            notes.push(format!("#blocked 原因双端不同，取本机；对端原因「{t}」已并入行尾注记"));
+        }
+        // 本机已解除阻塞（base 有原因）、对端改了原因：解除生效不复活标签，
+        // 对端文本不丢，落行尾注记
+        (None, Some(r)) => {
+            extra.push_str(&format!(" # 对端受阻原因：{r}"));
+            notes.push(format!(
+                "#blocked 本机已解除、对端仍受阻（原因「{r}」已并入行尾注记）"
+            ));
+        }
+        _ => {}
+    }
+
+    let mut tail_placed = false;
+    for t in &op.spans.tags {
+        if !matches!(
+            t.kind,
+            FlagOrBlocked::Doing | FlagOrBlocked::Paused | FlagOrBlocked::Time | FlagOrBlocked::TimeStart
+        ) {
+            continue;
+        }
+        let mut start = t.span.0;
+        if start > 0 && b[start - 1] == b' ' {
+            start -= 1;
+        }
+        let end = t.value.map_or(t.span.1, |(_, ve)| ve.max(t.span.1));
+        let replacement = if tail_placed {
+            String::new()
+        } else {
+            tail_placed = true;
+            tail.clone()
+        };
+        edits.push((start, end, replacement));
+    }
+    if !tail_placed && !tail.is_empty() {
+        edits.push((b.len(), b.len(), tail));
+    }
+    if !extra.is_empty() {
+        // 行尾并入 theirs 用户文本（注记/受阻原因分歧）；零长区间在行尾
+        // 永不与其他编辑重叠，稳定排序保证落在 tail 之后
+        edits.push((b.len(), b.len(), extra));
+    }
+
+    // 3) checkbox（区间在行首，不受尾部编辑影响）
+    let (cs, ce) = op.spans.cb;
+    edits.push((cs, ce, if checked { "x".to_string() } else { " ".to_string() }));
+
+    // 4) 优先级/分类（裁决结果 != ours 当前值时才动区间；手法对齐
+    //    set_priority/set_category：删除连尾随空格、插入带尾随空格）
+    if prio != op.priority {
+        let anchor = op.spans.cat.map(|(s, _)| s).unwrap_or(op.spans.content.0);
+        match (op.spans.prio, prio) {
+            (None, None) => {}
+            (None, Some(p)) => edits.push((anchor, anchor, format!("({}) ", p.as_str()))),
+            (Some((s, e)), None) => edits.push((s, cut_with_space(b, e), String::new())),
+            (Some((s, e)), Some(p)) => edits.push((s, e, format!("({})", p.as_str()))),
+        }
+    }
+    if cat != op.category {
+        let anchor = op.spans.content.0;
+        let word = |c: Category| match c {
+            Category::Work => "[工作]",
+            Category::Personal => "[个人]",
+            Category::Uncategorized => "",
+        };
+        match (op.spans.cat, cat) {
+            (None, c) if !word(c).is_empty() => edits.push((anchor, anchor, format!("{} ", word(c)))),
+            (Some((s, e)), Category::Uncategorized) => {
+                edits.push((s, cut_with_space(b, e), String::new()))
+            }
+            (Some((s, e)), c) => edits.push((s, e, word(c).to_string())),
+            _ => {}
+        }
+    }
+
+    // 区间全部基于 ours 原始行，排序后一次应用（稳定排序保追加序）
+    edits.sort_by_key(|e| e.0);
+    let mut out = String::with_capacity(ours.len() + 32);
+    let mut cursor = 0usize;
+    for (start, end, replacement) in &edits {
+        if *start < cursor {
+            return None; // 区间重叠＝内部错误，拒绝产出
+        }
+        out.push_str(&ours[cursor..*start]);
+        out.push_str(replacement);
+        cursor = *end;
+    }
+    out.push_str(&ours[cursor..]);
+
+    // 5) theirs 独有的 display 信息已由 extra 并入行尾（见上），无遗留处理
+
+    // 产物必须仍是合法任务行且派生态符合裁决（防御）
+    let check = parse_task_line(&out)?;
+    if check.checked != checked || check.status != status || check.content != op.content {
+        return None;
+    }
+    Some(MergedTaskLine { line: out, notes })
+}
+
+/// 状态三方裁决：单侧改动取动侧；双端都改（或无 base 参照）取更高进度。
+/// 进度序 Done > Doing > Paused > Todo（计划：doing 优先于 paused）。
+fn three_way_status(b: TaskStatus, o: TaskStatus, t: TaskStatus) -> TaskStatus {
+    if t == b {
+        return o;
+    }
+    if o == b {
+        return t;
+    }
+    max_status(o, t)
+}
+
+/// 无 base 参照（add/add）时取更高进度。
+fn max_status(o: TaskStatus, t: TaskStatus) -> TaskStatus {
+    let rank = |s: TaskStatus| match s {
+        TaskStatus::Todo => 0,
+        TaskStatus::Paused => 1,
+        TaskStatus::Doing => 2,
+        TaskStatus::Done => 3,
+    };
+    if rank(o) >= rank(t) { o } else { t }
+}
+
+/// 删除标签/前缀时连同其一个尾随空格（对齐 set_category 的删除手法）。
+fn cut_with_space(b: &[u8], end: usize) -> usize {
+    if end < b.len() && b[end] == b' ' { end + 1 } else { end }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1152,5 +1445,203 @@ mod tests {
         let reparsed = TodoFile::parse("## 日任务\n- [ ] (P1) [工作] 完成样本 #t 120 #paused\n");
         assert_eq!(reparsed.tasks[0].timer_secs, 120);
         assert_eq!(reparsed.tasks[0].status, TaskStatus::Paused);
+    }
+
+    // ── 冲突自动合并（v0.8.6）行级三方合并 T-P ─────────────────────
+
+    /// ours==theirs：字节不变直接返回（含标签/注记的复杂行零手术）。
+    #[test]
+    fn merge_identical_sides_returns_ours_verbatim() {
+        let m = three_way_merge_task_line(
+            Some("- [ ] 任务A"),
+            "- [ ] 任务A #doing #ts 1789000000 补记9/2",
+            "- [ ] 任务A #doing #ts 1789000000 补记9/2",
+        )
+        .unwrap();
+        assert_eq!(m.line, "- [ ] 任务A #doing #ts 1789000000 补记9/2");
+        assert!(m.notes.is_empty());
+    }
+
+    /// base==theirs（对端未动）：保留 ours 原文，含 ours 新增注记。
+    #[test]
+    fn merge_base_equals_theirs_keeps_ours() {
+        let m = three_way_merge_task_line(
+            Some("- [ ] 任务A"),
+            "- [ ] 任务A #paused 本机补记",
+            "- [ ] 任务A",
+        )
+        .unwrap();
+        assert_eq!(m.line, "- [ ] 任务A #paused 本机补记");
+        assert!(m.notes.is_empty());
+    }
+
+    /// base==ours（本机未动）：整体取 theirs。
+    #[test]
+    fn merge_base_equals_ours_takes_theirs() {
+        let m = three_way_merge_task_line(
+            Some("- [ ] 任务A"),
+            "- [ ] 任务A",
+            "- [x] 任务A #t 300",
+        )
+        .unwrap();
+        assert_eq!(m.line, "- [x] 任务A #t 300");
+    }
+
+    /// 状态双改不同方向（本机完成/对端进行中）→ 更高进度 Done 胜出，
+    /// theirs 的 #doing/#ts 清理干净。
+    #[test]
+    fn merge_status_double_change_takes_higher_progress() {
+        let m = three_way_merge_task_line(
+            Some("- [ ] 任务A"),
+            "- [x] 任务A",
+            "- [ ] 任务A #doing #ts 1789000000",
+        )
+        .unwrap();
+        assert_eq!(m.line, "- [x] 任务A");
+        assert!(m.notes.is_empty());
+    }
+
+    /// 计时取 max：双侧都改 #t（200 vs 300）→ 300，状态标签组原位重写。
+    #[test]
+    fn merge_timer_takes_max() {
+        let m = three_way_merge_task_line(
+            Some("- [ ] 任务A #t 100 #paused"),
+            "- [ ] 任务A #t 200 #paused",
+            "- [ ] 任务A #t 300 #paused",
+        )
+        .unwrap();
+        assert_eq!(m.line, "- [ ] 任务A #t 300 #paused");
+    }
+
+    /// theirs 单侧新增标签（#blocked 原因）→ 加侧胜，原样采纳。
+    #[test]
+    fn merge_theirs_side_tag_adopted() {
+        let m = three_way_merge_task_line(
+            Some("- [ ] 任务A"),
+            "- [x] 任务A",
+            "- [ ] 任务A #blocked 等审批",
+        )
+        .unwrap();
+        assert_eq!(m.line, "- [x] 任务A #blocked 等审批");
+        assert!(m.notes.is_empty());
+    }
+
+    /// 内容主体双改不同 → None（真冲突，交人工）。
+    #[test]
+    fn merge_content_divergence_is_conflict() {
+        assert!(three_way_merge_task_line(
+            Some("- [ ] 任务A"),
+            "- [ ] 任务A 本机改写",
+            "- [ ] 任务A 对端改写",
+        )
+        .is_none());
+    }
+
+    /// add/add（无 base）：同键新建行按属性规则合并——状态取更高进度、
+    /// 计时取 max、勾选或运算。
+    #[test]
+    fn merge_add_add_without_base() {
+        let m = three_way_merge_task_line(
+            None,
+            "- [ ] 任务A #t 100",
+            "- [x] 任务A #t 50",
+        )
+        .unwrap();
+        assert_eq!(m.line, "- [x] 任务A #t 100");
+    }
+
+    /// 优先级单侧改动（对端加 P0）→ 采纳对端；位置对齐 set_priority 手法。
+    /// （仅 #t 的 ours 行按 Paused 解读，合并行保 Paused 态。）
+    #[test]
+    fn merge_priority_single_side_adopted() {
+        let m = three_way_merge_task_line(
+            Some("- [ ] 任务A"),
+            "- [ ] 任务A #t 10",
+            "- [ ] (P0) 任务A",
+        )
+        .unwrap();
+        assert_eq!(m.line, "- [ ] (P0) 任务A #t 10 #paused");
+    }
+
+    /// 分类单侧改动（对端加 [工作]）→ 采纳对端。
+    #[test]
+    fn merge_category_single_side_adopted() {
+        let m = three_way_merge_task_line(
+            Some("- [ ] 任务A"),
+            "- [ ] 任务A #t 5",
+            "- [ ] [工作] 任务A",
+        )
+        .unwrap();
+        assert_eq!(m.line, "- [ ] [工作] 任务A #t 5 #paused");
+    }
+
+    /// 优先级双改不同 → 取本机 + note 留档。
+    #[test]
+    fn merge_priority_double_change_keeps_ours_with_note() {
+        let m = three_way_merge_task_line(
+            Some("- [ ] (P2) 任务A"),
+            "- [ ] (P0) 任务A",
+            "- [ ] (P1) 任务A",
+        )
+        .unwrap();
+        assert_eq!(m.line, "- [ ] (P0) 任务A");
+        assert!(m.notes.iter().any(|n| n.contains("优先级")));
+    }
+
+    /// 注记保真：状态手术不得把标签后注记挤到新标签之前（否则注记被
+    /// content 吞掉、身份键漂移）。
+    #[test]
+    fn merge_annotation_survives_tag_surgery() {
+        let m = three_way_merge_task_line(
+            Some("- [ ] 任务A"),
+            "- [ ] 任务A #doing 补记9/2",
+            "- [ ] 任务A #paused",
+        )
+        .unwrap();
+        assert_eq!(m.line, "- [ ] 任务A #doing 补记9/2");
+        // 回读验证注记仍是注记、content 不变
+        let f = TodoFile::parse(&format!("## 日任务\n{}\n", m.line));
+        assert_eq!(f.tasks[0].display, "任务A 补记9/2");
+    }
+
+    /// #blocked 原因双改不同：取本机、对端原因落行尾注记；追加带 " #"
+    /// 边界，回读不再把注记吞进受阻原因。
+    #[test]
+    fn merge_blocked_reason_divergence_not_absorbed_on_reparse() {
+        let m = three_way_merge_task_line(
+            Some("- [ ] 任务A #blocked 旧因"),
+            "- [ ] 任务A #blocked 本机因",
+            "- [ ] 任务A #blocked 对端因",
+        )
+        .unwrap();
+        assert!(m.line.contains("#blocked 本机因"));
+        assert!(m.line.contains("对端受阻原因：对端因"));
+        let f = TodoFile::parse(&format!("## 日任务\n{}\n", m.line));
+        assert_eq!(f.tasks[0].blocked_reason.as_deref(), Some("本机因"));
+    }
+
+    /// 本机解除阻塞、对端改原因：无标签锚点时行尾附注必进 content（身份
+    /// 漂移），防御校验拒绝 → 人工（解除 vs 仍在阻塞本就是意图分歧）；
+    /// ours 有标签锚点时解除生效，对端文本以行尾注记无损保留。
+    #[test]
+    fn merge_unblocked_here_reason_changed_there() {
+        // 无锚点：人工
+        assert!(three_way_merge_task_line(
+            Some("- [ ] 任务A #blocked 旧因"),
+            "- [ ] 任务A",
+            "- [ ] 任务A #blocked 新因",
+        )
+        .is_none());
+        // 有 #t 锚点：解除生效 + 注记保留 + 回读不重新阻塞
+        let m = three_way_merge_task_line(
+            Some("- [ ] 任务A #blocked 旧因 #t 30"),
+            "- [ ] 任务A #t 30",
+            "- [ ] 任务A #blocked 新因 #t 30",
+        )
+        .unwrap();
+        assert!(m.line.contains("对端受阻原因：新因"));
+        let f = TodoFile::parse(&format!("## 日任务\n{}\n", m.line));
+        assert!(f.tasks[0].blocked_reason.is_none());
+        assert!(f.tasks[0].display.contains("新因"));
     }
 }

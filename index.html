@@ -6,7 +6,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>日課</title>
     <script type="module" src="/src/main.ts" defer></script>
-    <script type="module" src="/src/themes.ts"></script>
   </head>
 
   <body>
@@ -51,7 +50,16 @@
       <div id="overdue-sum" class="overdue-sum" hidden></div>
       <div id="groups"></div>
       <div id="add-slot"></div>
-      <div id="note-square"><textarea aria-label="速记" placeholder="写点什么~"></textarea><span id="note-square-status" role="status"></span></div>
+      <section id="board" aria-label="便签板">
+        <div class="board-head">
+          <span class="board-title">便签</span>
+          <span class="board-count" id="board-count"></span>
+          <span class="board-status" id="board-status" role="status" aria-live="polite"></span>
+          <button id="board-add" type="button" title="贴一张便签">＋ 贴一张</button>
+        </div>
+        <div id="board-grid"></div>
+        <div id="board-undo" hidden><span class="board-undo-txt">已撕掉便签</span><button id="board-undo-btn" type="button">撤销</button></div>
+      </section>
 
       <div id="undo" class="undo" hidden></div>
       <div id="ctx" class="ctx" hidden></div>
@@ -92,6 +100,14 @@
         <span id="sync-tag" hidden>sticky</span>
         </button>
       </div>
+      <div id="board-mask" hidden><div class="board-editor" role="dialog" aria-label="编辑便签">
+        <div class="board-editor-head" data-tauri-drag-region>
+          <input id="board-title" type="text" placeholder="标题" spellcheck="false" autocomplete="off" aria-label="便签标题">
+          <button id="board-zoom" type="button" title="放大" aria-label="放大">⤢</button>
+        </div>
+        <textarea id="board-area" placeholder="写点什么~" spellcheck="false"></textarea>
+        <div class="board-zoom-resize" aria-hidden="true"></div>
+      </div></div>
     </main>
   </body>
 </html>

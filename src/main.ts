@@ -4,7 +4,8 @@
  * 编辑使用开始操作时的视图/版本；后台刷新延迟到输入完成，避免拆除草稿。
  */
 
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   ApiError,
@@ -18,6 +19,136 @@ import {
 } from "./api";
 import { render, renderAdd, renderSync, renderSyncSettings, renderNotes, mmdd, weekdayCn, isoLine, TOUCH_DEVICE, formatHms, timerDisplaySecs, TIMER_CAP_SECS, taskKey, holdSortOrder, releaseSortOrder, type FoldState } from "./render";
 
+interface BoardZoomPayload {
+  notebookId: string;
+  date: string;
+  id: string;
+  content: string;
+  paper: string;
+  isNew: boolean;
+  typed: boolean;
+}
+
+/** sticker.content 首行=标题、余下=正文；编辑器分别填进 #board-title / #board-area。
+ *  取舍：以 "\n" 结尾的内容重开+保存会丢末尾空行——可接受的规范化。 */
+function splitStickerContent(content: string): { title: string; body: string } {
+  const idx = content.indexOf("\n");
+  return idx === -1 ? { title: content, body: "" } : { title: content.slice(0, idx), body: content.slice(idx + 1) };
+}
+function composeStickerContent(title: string, body: string): string {
+  return body === "" ? title : `${title}\n${body}`;
+}
+/** 存量内容的规范化（仅"正文为空却带结尾换行"一种形态会变，如 "abc\n"→"abc"）。
+ *  脏比较双方都走它，避免旧数据在纯打开+关闭时被判脏而触发无编辑保存。 */
+function normalizeStickerContent(content: string): string {
+  const { title, body } = splitStickerContent(content);
+  return composeStickerContent(title, body);
+}
+
+function initBoardEditorPage(): void {
+  document.body.classList.add("editor-page");
+  try {
+    // 校验到现存主题集合：存档里可能有已下线的主题（如午夜墨蓝），照用会得到无样式的默认纸色。
+    const savedTheme = localStorage.getItem("sticky-todo.theme") || "glass";
+    document.documentElement.dataset.theme = savedTheme === "classic" ? "classic" : "glass";
+  } catch { /* Use the default paper colors for this window. */ }
+  const mask = document.querySelector<HTMLElement>("#board-mask")!;
+  const paper = mask.querySelector<HTMLElement>(".board-editor")!;
+  const title = mask.querySelector<HTMLInputElement>("#board-title")!;
+  const area = mask.querySelector<HTMLTextAreaElement>("#board-area")!;
+  const zoom = mask.querySelector<HTMLButtonElement>("#board-zoom")!;
+  const resize = mask.querySelector<HTMLElement>(".board-zoom-resize")!;
+  mask.hidden = false;
+  paper.classList.add("is-zoom");
+  zoom.textContent = "⤡";
+  zoom.title = zoom.ariaLabel = "还原";
+  let active = false;
+  let activeId = "";
+  let typed = false;
+  const restore = () => {
+    if (!active) return;
+    active = false;
+    void emit("board-zoom-restore", { content: composeStickerContent(title.value, area.value), typed });
+  };
+  title.addEventListener("input", () => { typed = true; });
+  area.addEventListener("input", () => { typed = true; });
+  zoom.addEventListener("click", restore);
+  window.addEventListener("keydown", ev => {
+    if (ev.key === "Escape" && !ev.isComposing && ev.keyCode !== 229) {
+      ev.preventDefault();
+      restore();
+    }
+  });
+  let start: { x: number; y: number; width: number } | null = null;
+  let resizePending = false;
+  resize.addEventListener("pointerdown", ev => {
+    if (!active) return;
+    ev.preventDefault();
+    start = { x: ev.clientX, y: ev.clientY, width: paper.getBoundingClientRect().width };
+    resize.setPointerCapture(ev.pointerId);
+    paper.classList.add("is-resizing");
+  });
+  resize.addEventListener("pointermove", ev => {
+    if (!start || !resize.hasPointerCapture(ev.pointerId)) return;
+    const dx = ev.clientX - start.x;
+    const dy = (ev.clientY - start.y) * 210 / 297;
+    const width = Math.max(340, start.width + (Math.abs(dx) >= Math.abs(dy) ? dx : dy));
+    paper.style.width = `${width}px`;
+    paper.style.height = `${width * 297 / 210}px`;
+  });
+  const finishResize = (ev: PointerEvent) => {
+    if (!start) return;
+    start = null;
+    paper.classList.remove("is-resizing");
+    if (resize.hasPointerCapture(ev.pointerId)) resize.releasePointerCapture(ev.pointerId);
+    if (ev.type === "pointerup") {
+      resizePending = true;
+      void emit("board-zoom-resize", { width: paper.getBoundingClientRect().width }).catch(() => {
+        resizePending = false;
+        paper.style.removeProperty("width");
+        paper.style.removeProperty("height");
+      });
+    } else {
+      paper.style.removeProperty("width");
+      paper.style.removeProperty("height");
+    }
+  };
+  resize.addEventListener("pointerup", finishResize);
+  resize.addEventListener("pointercancel", finishResize);
+  void (async () => {
+    await listen<BoardZoomPayload>("board-zoom-open", ev => {
+      if (active && activeId === ev.payload.id) return;
+      const { content, paper: paperColor } = ev.payload;
+      paper.style.setProperty("--ed-paper", paperColor);
+      const split = splitStickerContent(content);
+      title.value = split.title;
+      area.value = split.body;
+      paper.style.removeProperty("width");
+      paper.style.removeProperty("height");
+      activeId = ev.payload.id;
+      typed = ev.payload.typed;
+      active = true;
+      title.focus();
+    });
+    await listen("board-zoom-request-content", restore);
+    await listen("board-zoom-resize-done", () => {
+      if (!resizePending) return;
+      resizePending = false;
+      paper.style.removeProperty("width");
+      paper.style.removeProperty("height");
+    });
+    await emit("board-editor-ready");
+  })();
+}
+
+if (getCurrentWebviewWindow().label === "board-editor") {
+  initBoardEditorPage();
+} else {
+  void import("./themes");
+  initMainPage();
+}
+
+function initMainPage(): void {
 const SINK_IDLE_MS = 5000;
 const ADD_CAT_CYCLE: Array<string | null> = ["work", "personal", null];
 const ADD_CAT_LABEL: Record<string, string> = {
@@ -118,7 +249,7 @@ function finishEditor(): void {
 }
 
 function canNavigate(): boolean {
-  const note = dirtyNotes()[0] ?? (TOUCH_DEVICE ? notesBody.querySelector<HTMLTextAreaElement>('[data-saving="true"]') : noteSquare.dataset.saving === "true" ? noteSquare : null);
+  const note = dirtyNotes()[0] ?? notesBody.querySelector<HTMLTextAreaElement>('[data-saving="true"]');
   if (note) {
     if (TOUCH_DEVICE) {
       notesPanel.hidden = false;
@@ -141,7 +272,7 @@ function canNavigate(): boolean {
 
 function navigate(): void {
   hideUndo();
-  if (!TOUCH_DEVICE) void loadNoteSquare();
+  if (!TOUCH_DEVICE) void loadBoard();
   app.view = null;
   rerender();
   void refresh();
@@ -227,7 +358,7 @@ async function refresh(silent = true): Promise<void> {
     leftoversCache = lo;
     app.notebooks = notebooks;
     renderNotebooks();
-    if (!TOUCH_DEVICE) void loadNoteSquare();
+    if (!TOUCH_DEVICE) void loadBoard();
     app.repoReady = true;
     loadError = null;
     rerender();
@@ -350,87 +481,406 @@ const notesToggle = root.querySelector<HTMLButtonElement>("#notes-toggle")!;
 const notesPanel = root.querySelector<HTMLElement>("#notes-panel")!;
 const notesBody = root.querySelector<HTMLElement>("#notes-body")!;
 const notesTitle = root.querySelector<HTMLElement>("#notes-title")!;
-const notesStatus = root.querySelector<HTMLElement>(TOUCH_DEVICE ? "#notes-status" : "#note-square-status")!;
-const noteSquare = root.querySelector<HTMLTextAreaElement>("#note-square textarea")!;
+const notesStatus = root.querySelector<HTMLElement>("#notes-status")!;
 let notesRequestId = 0;
 
 function dirtyNotes(): HTMLTextAreaElement[] {
-  // 桌面与触摸同口径：常驻方块与速记面板的输入框一律计入草稿判定，
   // 避免面板草稿被后台刷新（view-changed）或导航重绘清掉。
-  return [noteSquare, ...Array.from(notesBody.querySelectorAll<HTMLTextAreaElement>(".notes-input"))]
+  return Array.from(notesBody.querySelectorAll<HTMLTextAreaElement>(".notes-input"))
     .filter(input => input.value !== input.dataset.loaded);
 }
 
-const NOTE_CACHE_KEY = "sticky.note.today";
-let squareRequestId = 0;
-let squareLoading: Promise<void> | null = null;
+interface BoardSticker { id: string; content: string; baseVersion: string }
+const fallbackStickyPapers = ["#f0e9d2", "#e2e8ec", "#eee2de", "#e3ebdd", "#ebe9e3"];
+function readStickyPapers(): string[] {
+  const styles = getComputedStyle(document.documentElement);
+  return fallbackStickyPapers.map((fallback, i) => styles.getPropertyValue(`--sticky-paper-${i}`).trim() || fallback);
+}
+let stickyPapers = readStickyPapers();
+const boardGrid = root.querySelector<HTMLElement>("#board-grid")!;
+const boardCount = root.querySelector<HTMLElement>("#board-count")!;
+const boardStatus = root.querySelector<HTMLElement>("#board-status")!;
+const boardMask = root.querySelector<HTMLElement>("#board-mask")!;
+const boardEditorElement = root.querySelector<HTMLElement>(".board-editor")!;
+const boardZoom = root.querySelector<HTMLButtonElement>("#board-zoom")!;
+const boardTitle = root.querySelector<HTMLInputElement>("#board-title")!;
+const boardArea = root.querySelector<HTMLTextAreaElement>("#board-area")!;
+// 标题行的拖拽属性只服务独立放大窗；主窗口内联编辑器若保留会拖走主窗，摘除。
+boardTitle.parentElement!.removeAttribute("data-tauri-drag-region");
+const boardUndo = root.querySelector<HTMLElement>("#board-undo")!;
+let stickies: BoardSticker[] = [];
+let boardEditor: { sticker: BoardSticker; isNew: boolean; typed: boolean } | null = null;
+let boardUndoTimer: ReturnType<typeof setTimeout> | null = null;
+let boardSaving = false;
+let boardEditorSaving = false;
+let boardSavePromise: Promise<boolean> | null = null;
+let boardRequestId = 0;
+let boardDirty = false; // 编辑态错过 loadBoard（如撤销恢复）时，关编辑层后补刷
+let boardZoomed = false;
+let boardWindowRestoring = false;
+let pendingBoardZoom: BoardZoomPayload | null = null;
+let boardRestoreRequested = false;
+let boardRestored: (() => void) | null = null;
+// Serialize set_board_window calls so a quick toggle cannot restore before enlargement finishes.
+let boardWindowChange: Promise<void> = Promise.resolve();
+let boardDate = todayStr();
+let boardNotebookId = app.notebookId;
 
-function cacheNoteSquare(date: string, content: string, notebookId: string): void {
-  try {
-    // Keep the requested cache shape, with a separate owner to avoid notebook leaks.
-    localStorage.setItem(NOTE_CACHE_KEY + ".notebook", notebookId);
-    localStorage.setItem(NOTE_CACHE_KEY, JSON.stringify({ date, content }));
-  } catch { /* Storage is optional. */ }
+function boardHash(s: string): number {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return h;
+}
+function idxFor(id: string): number { return boardHash(id) % 5; }
+function adjColors(): number[] {
+  const used = stickies.map(s => idxFor(s.id));
+  for (let i = 0; i < used.length; i++) {
+    while (used[i] === used[i - 1] || (i >= 3 && used[i] === used[i - 3])) used[i] = (used[i] + 1) % 5;
+  }
+  return used;
+}
+function rotAt(i: number, id: string): number {
+  const r = Math.floor(i / 3), c = i % 3;
+  const dir = (r + c) % 2 === 0 ? -1 : 1;
+  return dir * (1.6 + (boardHash("j" + id) % 5) / 10);
+}
+function boardError(error: unknown): string { return error instanceof Error ? error.message : String(error); }
+function hideBoardUndo(): void {
+  if (boardUndoTimer) clearTimeout(boardUndoTimer);
+  boardUndoTimer = null;
+  boardUndo.hidden = true;
 }
 
-function loadNoteSquare(): Promise<void> {
+function renderBoard(): void {
+  boardGrid.replaceChildren();
+  const visibleStickies = stickies.filter(sticker => !(boardEditor?.isNew && boardEditor.sticker.id === sticker.id));
+  boardCount.textContent = `${visibleStickies.length} 张`;
+  if (!visibleStickies.length) {
+    const empty = document.createElement("div");
+    empty.className = "board-empty";
+    empty.append(document.createTextNode("空板一张 · "));
+    const add = document.createElement("button");
+    add.type = "button";
+    add.textContent = "贴一张";
+    add.addEventListener("click", () => { void createBoardSticker(); });
+    empty.append(add);
+    boardGrid.append(empty);
+    return;
+  }
+  const colors = adjColors();
+  visibleStickies.forEach((sticker, i) => {
+    const paper = document.createElement("div");
+    paper.className = "board-sticker";
+    paper.tabIndex = 0;
+    paper.setAttribute("role", "button");
+    paper.setAttribute("aria-label", "编辑便签");
+    paper.style.setProperty("--paper", stickyPapers[colors[i]]);
+    paper.style.setProperty("--rot", `${rotAt(i, sticker.id)}deg`);
+    const pin = document.createElement("span");
+    pin.className = "board-pin";
+    const lines = sticker.content.split(/\r?\n/);
+    const first = lines.findIndex(line => line.trim() !== "");
+    const title = document.createElement("div");
+    title.className = "board-sticker-title";
+    title.textContent = first < 0 ? "（空）" : lines[first];
+    if (first < 0) title.classList.add("is-empty");
+    const body = document.createElement("div");
+    body.className = "board-sticker-text";
+    body.textContent = first < 0 ? "" : lines.slice(first + 1).join("\n");
+    const time = document.createElement("span");
+    time.className = "board-sticker-time";
+    const ms = Number(sticker.id.slice(0, 13));
+    time.textContent = Number.isFinite(ms) && ms > 0
+      ? new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false }) : "";
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "board-sticker-x";
+    remove.setAttribute("aria-label", "撕掉便签");
+    remove.textContent = "✕";
+    remove.addEventListener("click", ev => { ev.stopPropagation(); void deleteBoardSticker(sticker.id); });
+    paper.addEventListener("click", () => openBoardEditor(sticker, false));
+    paper.addEventListener("keydown", ev => {
+      if (ev.isComposing || ev.keyCode === 229 || ev.key !== "Enter" || ev.target !== paper) return;
+      ev.preventDefault();
+      openBoardEditor(sticker, false);
+    });
+    paper.append(pin, title, body, time, remove);
+    boardGrid.append(paper);
+  });
+}
+
+async function loadBoard(): Promise<void> {
+  if (boardEditor || boardSaving) return;
+  const id = ++boardRequestId;
   const notebookId = app.notebookId;
-  const date = todayStr();
-  const changed = noteSquare.dataset.notebookId !== notebookId || noteSquare.dataset.noteDate !== date;
-  if (changed) {
-    if (dirtyNotes().length || noteSquare.dataset.saving === "true") return Promise.resolve();
-    noteSquare.value = "";
-    noteSquare.dataset.loaded = "";
-    noteSquare.dataset.notebookId = notebookId;
-    noteSquare.dataset.noteDate = date;
-    delete noteSquare.dataset.baseVersion;
-    notesStatus.textContent = "";
+  const date = app.dayDate ?? todayStr();
+  if (boardNotebookId !== notebookId || boardDate !== date) {
+    boardNotebookId = notebookId;
+    boardDate = date;
+    stickies = [];
+    hideBoardUndo();
+    renderBoard();
+  }
+  try {
+    const dto = await api.listSticky(notebookId, date);
+    if (id !== boardRequestId || notebookId !== app.notebookId || date !== (app.dayDate ?? todayStr()) || boardEditor) return;
+    boardNotebookId = notebookId;
+    boardDate = date;
+    stickies = dto.stickies.map(s => ({ id: s.id, content: s.content, baseVersion: s.base_version }));
+    renderBoard();
+    boardStatus.textContent = "";
+  } catch (error) {
+    if (id === boardRequestId) boardStatus.textContent = boardError(error);
+  }
+}
+
+async function createBoardSticker(): Promise<void> {
+  if (boardSaving || boardEditor) return;
+  boardSaving = true;
+  ++boardRequestId;
+  const notebookId = app.notebookId;
+  const date = app.dayDate ?? todayStr();
+  try {
+    const created = await api.addSticky(notebookId, date, "");
+    if (notebookId !== app.notebookId || date !== (app.dayDate ?? todayStr())) {
+      await api.deleteSticky(notebookId, date, created.id, created.base_version);
+      return;
+    }
+    boardNotebookId = notebookId;
+    boardDate = date;
+    const sticker = { id: created.id, content: "", baseVersion: created.base_version };
+    stickies.push(sticker);
+    boardSaving = false;
+    openBoardEditor(sticker, true);
+    renderBoard();
+    boardStatus.textContent = "";
+  } catch (error) { boardStatus.textContent = boardError(error); }
+  finally {
+    boardSaving = false;
+    if (notebookId !== app.notebookId || date !== (app.dayDate ?? todayStr())) void loadBoard();
+  }
+}
+
+function openBoardEditor(sticker: BoardSticker, isNew: boolean): void {
+  if (boardEditor || boardSaving) return;
+  resetBoardZoom();
+  boardEditor = { sticker, isNew, typed: false };
+  const split = splitStickerContent(sticker.content);
+  boardTitle.value = split.title;
+  boardArea.value = split.body;
+  boardEditorElement.style.setProperty("--ed-paper", stickyPapers[adjColors()[stickies.indexOf(sticker)]]);
+  boardMask.hidden = false;
+  boardTitle.focus();
+}
+function resetBoardZoom(): void {
+  const wasZoomed = boardZoomed;
+  boardZoomed = false;
+  pendingBoardZoom = null;
+  boardRestoreRequested = false;
+  if (wasZoomed) {
+    boardWindowRestoring = true;
+    boardWindowChange = boardWindowChange.then(() => api.setBoardWindow(false))
+      .catch(error => { boardStatus.textContent = boardError(error); }).then(() => {
+      boardWindowRestoring = false;
+      lastHeight = -1;
+      measureHeight();
+    });
+  }
+}
+function setBoardZoom(zoomed: boolean): void {
+  if (!boardEditor) return;
+  if (zoomed) {
+    if (boardZoomed) return;
+    boardZoomed = true;
+    pendingBoardZoom = {
+      notebookId: boardNotebookId, date: boardDate, id: boardEditor.sticker.id,
+      content: composeStickerContent(boardTitle.value, boardArea.value),
+      paper: getComputedStyle(boardEditorElement).getPropertyValue("--ed-paper").trim(),
+      isNew: boardEditor.isNew, typed: boardEditor.typed,
+    };
+    boardMask.hidden = true;
+    boardWindowChange = boardWindowChange.then(async () => {
+      await api.setBoardWindow(true);
+      if (pendingBoardZoom) await emit("board-zoom-open", pendingBoardZoom);
+    }).catch(error => {
+      boardStatus.textContent = boardError(error);
+      boardZoomed = false;
+      pendingBoardZoom = null;
+      boardMask.hidden = false;
+    });
+  } else if (boardZoomed && !boardRestoreRequested) {
+    boardRestoreRequested = true;
+    void emit("board-zoom-request-content").catch(error => {
+      boardRestoreRequested = false;
+      boardStatus.textContent = boardError(error);
+    });
+  }
+}
+async function closeBoardEditor(): Promise<void> {
+  if (!boardEditor || boardEditorSaving || boardSaving) return;
+  const current = boardEditor;
+  if (current.isNew && !current.typed) {
+    boardSaving = true;
     try {
-      const cached = JSON.parse(localStorage.getItem(NOTE_CACHE_KEY) || "null");
-      const owner = localStorage.getItem(NOTE_CACHE_KEY + ".notebook");
-      if (cached?.date === date && typeof cached.content === "string" && (!owner || owner === notebookId)) {
-        noteSquare.value = cached.content;
-        noteSquare.dataset.loaded = cached.content;
-      }
-    } catch { /* Ignore invalid cache. */ }
-  } else if (squareLoading) return squareLoading;
-  else if (noteSquare.dataset.saving === "true") return Promise.resolve();
-  const id = ++squareRequestId;
-  squareLoading = (async () => {
+      await api.deleteSticky(boardNotebookId, boardDate, current.sticker.id, current.sticker.baseVersion);
+      stickies = stickies.filter(s => s.id !== current.sticker.id);
+      renderBoard();
+    } catch (error) { boardStatus.textContent = boardError(error); return; }
+    finally { boardSaving = false; }
+  } else if ((current.isNew && current.typed) || composeStickerContent(boardTitle.value, boardArea.value) !== normalizeStickerContent(current.sticker.content)) {
+    await saveBoardEditor();
+    return;
+  }
+  boardEditor = null;
+  resetBoardZoom();
+  boardMask.hidden = true;
+  if (boardDirty) { boardDirty = false; void loadBoard(); }
+  if (boardNotebookId !== app.notebookId || boardDate !== (app.dayDate ?? todayStr())) void loadBoard();
+}
+
+function saveBoardEditor(): Promise<boolean> {
+  if (boardSavePromise) return boardSavePromise;
+  if (!boardEditor) return Promise.resolve(true);
+  const current = boardEditor;
+  const content = composeStickerContent(boardTitle.value, boardArea.value);
+  if (new TextEncoder().encode(content).byteLength > 64000) {
+    boardStatus.textContent = "便签内容超过 64000 字节，请缩短后保存";
+    return Promise.resolve(false);
+  }
+  boardEditorSaving = true;
+  boardSavePromise = (async () => {
     try {
-      const dto = await api.getNotes(notebookId, "day", null);
-      if (id !== squareRequestId || notebookId !== app.notebookId) return;
-      const day = dto.days.find(day => day.date === date);
-      if (!day) return;
-      if (noteSquare.value !== noteSquare.dataset.loaded) return;
-      if (noteSquare.value && noteSquare.value !== day.content) {
-        // 关窗兜底草稿与远端不同：保留草稿并视为未保存，交给正常保存流程落盘，
-        // 不被远端内容静默顶掉；本地兜底缓存同样保留，待保存成功后再刷新。
-        noteSquare.dataset.loaded = day.content;
-        noteSquare.dataset.baseVersion = day.base_version;
-        notesStatus.textContent = "已恢复未保存的速记草稿，失焦保存将覆盖远端";
-        return;
-      }
-      if (noteSquare.value !== day.content) noteSquare.value = day.content;
-      noteSquare.dataset.loaded = day.content;
-      noteSquare.dataset.baseVersion = day.base_version;
-      cacheNoteSquare(date, day.content, notebookId);
-      notesStatus.textContent = "";
+      const result = await api.saveSticky(boardNotebookId, boardDate, current.sticker.id, content, current.sticker.baseVersion);
+      current.sticker.content = content;
+      current.sticker.baseVersion = result.base_version;
+      boardEditor = null;
+      resetBoardZoom();
+      boardMask.hidden = true;
+      renderBoard();
+      boardStatus.textContent = "已保存";
+      if (boardDirty) { boardDirty = false; void loadBoard(); }
+      if (boardNotebookId !== app.notebookId || boardDate !== (app.dayDate ?? todayStr())) void loadBoard();
+      return true;
     } catch (error) {
-      if (id === squareRequestId) notesStatus.textContent = error instanceof Error ? error.message : String(error);
+      if (error instanceof ApiError && error.code === "stale") {
+        boardEditor = null;
+        resetBoardZoom();
+        boardMask.hidden = true;
+        boardDirty = false;
+        await loadBoard();
+        boardStatus.textContent = "远端有更新，已刷新，请重试";
+      } else boardStatus.textContent = boardError(error);
+      return false;
     } finally {
-      if (id === squareRequestId) squareLoading = null;
+      boardEditorSaving = false;
+      boardSavePromise = null;
     }
   })();
-  return squareLoading;
+  return boardSavePromise;
+}
+async function boardFlushEditor(): Promise<boolean> {
+  if (!boardEditor || composeStickerContent(boardTitle.value, boardArea.value) === normalizeStickerContent(boardEditor.sticker.content)) return true;
+  return saveBoardEditor();
+}
+/** 放大窗内容回填内联编辑器并退出 zoomed 态；正常应答（board-zoom-restore）与
+ *  dismissed 看门狗兜底共用，保证两条路径的 typed/焦点/复位语义一致。 */
+function applyBoardZoomRestore(content: string, typed: boolean | undefined): void {
+  const split = splitStickerContent(content);
+  boardTitle.value = split.title;
+  boardArea.value = split.body;
+  if (boardEditor) {
+    boardEditor.typed = boardEditor.typed || Boolean(typed)
+      || content !== normalizeStickerContent(boardEditor.sticker.content);
+  }
+  boardMask.hidden = false;
+  resetBoardZoom();
+  boardTitle.focus();
+  boardRestored?.();
+  boardRestored = null;
 }
 
-noteSquare.dataset.loaded = ""; // 触摸端方块隐藏，但同样参与 dirtyNotes 判定，需先初始化口径
-if (!TOUCH_DEVICE) {
-  noteSquare.addEventListener("blur", () => { void saveNote(noteSquare); });
-  root.querySelector("#note-square")!.addEventListener("mouseleave", () => { void saveNote(noteSquare); });
-  void loadNoteSquare();
+async function deleteBoardSticker(id: string): Promise<void> {
+  if (boardSaving || boardEditor) return;
+  const sticker = stickies.find(s => s.id === id);
+  if (!sticker) return;
+  boardSaving = true;
+  ++boardRequestId;
+  const notebookId = boardNotebookId, date = boardDate;
+  try {
+    const result = await api.deleteSticky(notebookId, date, id, sticker.baseVersion);
+    stickies = stickies.filter(s => s.id !== id);
+    renderBoard();
+    hideBoardUndo();
+    boardUndo.hidden = false;
+    boardUndoTimer = setTimeout(hideBoardUndo, 3000);
+    const undoButton = root.querySelector<HTMLButtonElement>("#board-undo-btn")!;
+    undoButton.onclick = () => {
+      hideBoardUndo();
+      void (async () => {
+        try {
+          await api.restoreSticky(notebookId, date, id, result.removed_content);
+          if (boardEditor) { boardDirty = true; } else { await loadBoard(); }
+        } catch (error) { boardStatus.textContent = `撤销失败：${boardError(error)}`; }
+      })();
+    };
+    boardStatus.textContent = "";
+  } catch (error) { boardStatus.textContent = boardError(error); }
+  finally {
+    boardSaving = false;
+    if (notebookId !== app.notebookId || date !== (app.dayDate ?? todayStr())) void loadBoard();
+  }
 }
+
+root.querySelector("#board-add")!.addEventListener("click", () => { void createBoardSticker(); });
+boardZoom.addEventListener("click", () => setBoardZoom(true));
+void listen("board-editor-ready", () => {
+  if (pendingBoardZoom) void emit("board-zoom-open", pendingBoardZoom);
+});
+void listen("board-editor-dismissed", () => {
+  if (!boardZoomed) return;
+  setBoardZoom(false);
+  // 看门狗：编辑窗在 board-zoom-open 送达前被关闭（active=false）时不会应答
+  // request-content，boardZoomed/boardRestoreRequested 将永久卡死——⤢、便签板、
+  // ✕ 关闭全部失效。超时未应答则用 pendingBoardZoom 里最近送出的内容兜底还原。
+  window.setTimeout(() => {
+    if (!boardZoomed || !boardRestoreRequested || !pendingBoardZoom) return;
+    applyBoardZoomRestore(pendingBoardZoom.content, pendingBoardZoom.typed);
+  }, 3000);
+});
+void listen<{ width: number }>("board-zoom-resize", ev => {
+  if (!boardZoomed) return;
+  boardWindowChange = boardWindowChange.then(async () => {
+    try { await api.resizeBoardEditor(ev.payload.width); }
+    finally { await emit("board-zoom-resize-done"); }
+  }).catch(error => { boardStatus.textContent = boardError(error); });
+});
+void listen<{ content: string; typed?: boolean }>("board-zoom-restore", ev => {
+  if (!boardZoomed || !boardEditor) return;
+  applyBoardZoomRestore(ev.payload.content, ev.payload.typed);
+});
+boardTitle.addEventListener("input", () => { if (boardEditor) boardEditor.typed = true; });
+boardArea.addEventListener("input", () => { if (boardEditor) boardEditor.typed = true; });
+// 标题行回车＝跳到正文（不换行不保存）；Ctrl+Enter 保存已由 boardMask 委托接管。
+boardTitle.addEventListener("keydown", ev => {
+  if (ev.isComposing || ev.keyCode === 229) return;
+  if (ev.key === "Enter" && !ev.ctrlKey && !ev.metaKey) {
+    ev.preventDefault();
+    boardArea.focus();
+    boardArea.setSelectionRange(0, 0);
+  }
+});
+boardMask.addEventListener("click", ev => { if (ev.target === boardMask) void closeBoardEditor(); });
+boardMask.addEventListener("keydown", ev => {
+  if (ev.isComposing || ev.keyCode === 229) return;
+  if (ev.key === "Escape") { ev.preventDefault(); ev.stopPropagation(); void closeBoardEditor(); }
+  else if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); ev.stopPropagation(); void saveBoardEditor(); }
+});
+new MutationObserver(() => {
+  stickyPapers = readStickyPapers();
+  renderBoard();
+  if (boardEditor) boardEditorElement.style.setProperty("--ed-paper", stickyPapers[adjColors()[stickies.indexOf(boardEditor.sticker)]]);
+}).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+if (!TOUCH_DEVICE) void loadBoard();
 
 async function loadNotes(): Promise<void> {
   if (dirtyNotes().length || notesBody.querySelector('[data-saving="true"]')) return;
@@ -458,10 +908,6 @@ async function loadNotes(): Promise<void> {
 }
 
 async function saveNote(input: HTMLTextAreaElement): Promise<boolean> {
-  if (!TOUCH_DEVICE && input === noteSquare && (squareLoading || !input.dataset.baseVersion)) {
-    await loadNoteSquare();
-    if (!input.dataset.baseVersion) return false;
-  }
   // Blur and collapse can arrive together; serialize writes for each day.
   if (input.dataset.saving === "true") {
     if (input.value !== input.dataset.savingContent) input.dataset.saveAgain = "true";
@@ -483,7 +929,6 @@ async function saveNote(input: HTMLTextAreaElement): Promise<boolean> {
     const result = await api.saveNote(notebookId, date, content, input.dataset.baseVersion!);
     input.dataset.baseVersion = result.base_version;
     input.dataset.loaded = content;
-    if (!TOUCH_DEVICE && input === noteSquare) cacheNoteSquare(date, content, notebookId);
     notesStatus.textContent = input.value === content ? "已保存" : "仍有未保存的修改";
     saved = true;
   } catch (error) {
@@ -579,7 +1024,7 @@ async function testSyncConnection(): Promise<void> {
       timeout = window.setTimeout(() => reject(new Error("同步失败: 等待同步结果超时")), 90_000);
       void listen<SyncState>("sync-status", ({ payload }) => {
         if (payload.kind === "syncing") started = true;
-        else if (payload.kind === "idle" && started) resolve();
+        else if ((payload.kind === "idle" || payload.kind === "merged") && started) resolve();
         else if (payload.kind === "conflict" || payload.kind === "error") reject(new Error(payload.message));
         else if (payload.kind === "offline") reject(new Error("同步失败: 当前离线"));
       }).then(unlisten => {
@@ -1245,9 +1690,12 @@ let heightTimer: number | undefined;
 let lastHeight = -1;
 
 function measureHeight(): void {
+  if (boardZoomed) return;
+  if (boardWindowRestoring) return;
   if (TOUCH_DEVICE) return;
   window.clearTimeout(heightTimer);
   heightTimer = window.setTimeout(() => {
+    if (boardZoomed || boardWindowRestoring) return;
     // 量 #sticky 内容高：documentElement/body.scrollHeight 有 ≥客户区的
     // 隐性地板（scrollHeight ≥ clientHeight），窗口只会长高永不回缩；
     // 窗口改不透明后内容短时会露出空白面板尾，必须按内容真缩。
@@ -1427,6 +1875,7 @@ void listen("repo-ready", () => {
 void listen("view-changed", () => {
   if (app.repoReady) void refresh();
   if (!notesPanel.hidden && !dirtyNotes().length) void loadNotes();
+  if (!TOUCH_DEVICE) void loadBoard();
 });
 
 // 窗口右上角关闭（仅桌面；安卓 WebView UA 含 Android，保持 hidden）。
@@ -1440,18 +1889,24 @@ if (winCloseBtn && !/android/i.test(navigator.userAgent)) {
 
 async function closeWindow(): Promise<void> {
   if (!TOUCH_DEVICE) {
-    const saved = await saveNote(noteSquare).catch(() => false);
-    if (!saved) {
-      cacheNoteSquare(noteSquare.dataset.noteDate ?? todayStr(), noteSquare.value,
-        noteSquare.dataset.notebookId ?? app.notebookId);
+    if (boardZoomed) {
+      const restored = await new Promise<boolean>(resolve => {
+        const timeout = window.setTimeout(() => { boardRestored = null; resolve(false); }, 3000);
+        boardRestored = () => { window.clearTimeout(timeout); resolve(true); };
+        setBoardZoom(false);
+      });
+      if (!restored) { boardStatus.textContent = "无法取回便签内容，请先还原窗口再关闭。"; return; }
     }
+    if (boardEditor && composeStickerContent(boardTitle.value, boardArea.value) !== normalizeStickerContent(boardEditor.sticker.content) && !await boardFlushEditor()) return;
+    if (boardEditor?.isNew && !boardEditor.typed && !composeStickerContent(boardTitle.value, boardArea.value).trim()) await closeBoardEditor();
+    if (boardEditor?.isNew && !boardEditor.typed && !composeStickerContent(boardTitle.value, boardArea.value).trim()) return;
     // 速记面板里未保存的草稿同样落盘，不再只依赖 ExitRequested 兜底。
     await Promise.all(Array.from(notesBody.querySelectorAll<HTMLTextAreaElement>(".notes-input"))
       .filter(input => input.value !== input.dataset.loaded)
       .map(input => saveNote(input).catch(() => false)));
   }
   const deadline = Date.now() + 3000;
-  while (Date.now() < deadline && (mutationPending || noteSquare.dataset.saving === "true" || notesBody.querySelector('[data-saving="true"]'))) {
+  while (Date.now() < deadline && (mutationPending || boardEditorSaving || boardSaving || notesBody.querySelector('[data-saving="true"]'))) {
     await new Promise(resolve => setTimeout(resolve, 80));
   }
   try {
@@ -1485,3 +1940,4 @@ void api
   .catch(() => {});
 void refresh(); // 仓库已就绪时立即出数据（repo-ready 可能已错过）
 rerender();
+}
