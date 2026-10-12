@@ -121,6 +121,16 @@ struct PendingSource {
     text: String,
 }
 
+/// 流转候选＝全部未勾选任务（不限段位）。历史上语义合并曾把对端新增任务
+/// 错挂「## 备注」段下（2026-10-09 双机同日新建文件），只扫日任务段会让
+/// 这些任务永远滞留旧日期；解析层本就按任务对待它们，口径保持一致。
+fn unfinished_task_lines(file: &TodoFile) -> Vec<usize> {
+    file.tasks.iter()
+        .filter(|t| !t.checked)
+        .map(|t| t.line_idx)
+        .collect()
+}
+
 fn carry_notebook(store: &StickyStore, notebook_id: &str, today: NaiveDate) -> Result<CarryReport, CmdError> {
     let root = notebook::root(store.engine().repo_dir(), notebook_id)?;
     let dates = past_day_dates(&root.join("days"), today);
@@ -134,10 +144,11 @@ fn carry_notebook(store: &StickyStore, notebook_id: &str, today: NaiveDate) -> R
     let today_path = today_kind.abs_path(&root);
     let today_text = read_optional(&today_path, &today_kind.rel_path())?;
     let mut target: Option<TodoFile> = today_text.as_deref().map(TodoFile::parse);
-    // 去重表：今天已有的未勾选日任务，按 content 归组记「朴素/归一化块」
+    // 去重表：今天已有的未勾选任务（不限段位，与候选口径一致），按 content
+    // 归组记「朴素/归一化块」
     let mut seen: HashMap<String, Vec<SeenTask>> = HashMap::new();
     if let Some(t) = target.as_ref() {
-        for v in t.tasks.iter().filter(|v| !v.checked && v.section == DAY_TASK_SECTION) {
+        for v in t.tasks.iter().filter(|v| !v.checked) {
             seen.entry(v.content.clone()).or_default().push(SeenTask {
                 plain: is_plain(v),
                 block: normalized_block(t, v.line_idx),
@@ -153,10 +164,7 @@ fn carry_notebook(store: &StickyStore, notebook_id: &str, today: NaiveDate) -> R
         let path = kind.abs_path(&root);
         let Some(text) = read_optional(&path, &kind.rel_path())? else { continue };
         let mut file = TodoFile::parse(&text);
-        let candidates: Vec<usize> = file.tasks.iter()
-            .filter(|t| !t.checked && t.section == DAY_TASK_SECTION)
-            .map(|t| t.line_idx)
-            .collect();
+        let candidates = unfinished_task_lines(&file);
         if candidates.is_empty() {
             continue;
         }
@@ -279,5 +287,23 @@ mod tests {
         let target = target.unwrap();
         let contents: Vec<_> = target.tasks.iter().map(|t| t.content.as_str()).collect();
         assert_eq!(contents, ["已有任务", "任务A", "任务B"]);
+    }
+
+    /// 2026-10-09 实况回归：语义合并曾把对端新增任务错挂「## 备注」段下，
+    /// 流转候选只扫日任务段导致这些任务永远滞留旧日期。候选口径应与解析
+    /// 口径一致——未勾选任务不限段位，已勾选不搬运。
+    #[test]
+    fn unfinished_candidates_include_tasks_under_notes_section() {
+        let file = TodoFile::parse(
+            "## 日任务\n- [ ] 甲\n- [x] 乙\n\n## 完成事项\n\n## 备注\n- [ ] 丙\n  - 子行\n",
+        );
+        let got = unfinished_task_lines(&file);
+        let mut names: Vec<&str> = Vec::new();
+        for t in file.tasks.iter() {
+            if got.contains(&t.line_idx) {
+                names.push(t.content.as_str());
+            }
+        }
+        assert_eq!(names, ["甲", "丙"], "滞留备注段的未勾选任务应入选，已勾选不应");
     }
 }

@@ -17,7 +17,7 @@ import {
   type ViewDto,
   type ViewKind,
 } from "./api";
-import { render, renderAdd, renderSync, renderSyncSettings, renderNotes, mmdd, weekdayCn, isoLine, TOUCH_DEVICE, formatHms, timerDisplaySecs, TIMER_CAP_SECS, taskKey, holdSortOrder, releaseSortOrder, type FoldState } from "./render";
+import { render, renderAdd, renderSync, renderSyncSettings, renderNotes, mmdd, weekdayCn, isoLine, TOUCH_DEVICE, formatMmSs, timerDisplaySecs, POMO_SECS, taskKey, holdSortOrder, releaseSortOrder, type FoldState } from "./render";
 
 interface BoardZoomPayload {
   notebookId: string;
@@ -74,9 +74,20 @@ function initBoardEditorPage(): void {
   area.addEventListener("input", () => { typed = true; });
   zoom.addEventListener("click", restore);
   window.addEventListener("keydown", ev => {
-    if (ev.key === "Escape" && !ev.isComposing && ev.keyCode !== 229) {
+    if (!active || ev.isComposing || ev.keyCode === 229) return;
+    if (ev.key === "Escape") {
       ev.preventDefault();
       restore();
+    } else if (ev.key === "Enter" && ev.target === title && !ev.ctrlKey && !ev.metaKey) {
+      // 标题回车（含 Shift+Enter）＝跳到正文，与主窗内联编辑器语义一致。
+      ev.preventDefault();
+      area.focus();
+      area.setSelectionRange(0, 0);
+    } else if (ev.key === "Enter" && !ev.shiftKey && (ev.target === title || ev.target === area)) {
+      ev.preventDefault();
+      active = false;
+      void emit("board-zoom-save", { content: composeStickerContent(title.value, area.value), typed })
+        .catch(() => { active = true; });
     }
   });
   let start: { x: number; y: number; width: number } | null = null;
@@ -145,6 +156,7 @@ if (getCurrentWebviewWindow().label === "board-editor") {
   initBoardEditorPage();
 } else {
   void import("./themes");
+  if (/Windows NT/.test(navigator.userAgent)) void import("./update");
   initMainPage();
 }
 
@@ -417,40 +429,83 @@ function taskAt(line: number): TaskView | undefined {
   return app.view?.tasks[line];
 }
 
-// ---- v0.8 计时 ticker（§2.8）----
-// 每秒从累计值 + 时间戳重算（非 counter++）；只改 Text 节点 data，不 render/refresh/IPC；
-// 存在未封顶的有效 Doing 且页面可见时才运行 interval；重渲后按 DOM 重新定位。
+// ---- 番茄钟：扫描数据，折叠/隐藏只影响 DOM 写入，不影响到期结算 ----
 
 let tickerId: number | undefined;
+const pomoSettlements = new Set<string>();
+
+function deferPomoSettlement(): boolean {
+  // 保留既有 3s 删除撤销窗口，后台结算不抢占撤销版本或气泡。
+  return mutationPending || editor !== null || boardEditor !== null || undoPending !== null
+    || !!document.activeElement?.matches("input, textarea, [contenteditable='true']");
+}
+
+function queuePomoSettlement(view: ViewDto, task: TaskView): void {
+  const key = `${view.notebook_id}/${taskKey(task)}`;
+  if (pomoSettlements.has(key)) return;
+  pomoSettlements.add(key);
+  // 重渲会同步 tick；下一事件轮再发起，先让既有 edit 的 finally 收口。
+  window.setTimeout(() => {
+    void (async () => {
+      try {
+        if (app.view !== view || view.tasks[task.row_idx] !== task || deferPomoSettlement()) return;
+        const c = context(task.row_idx);
+        const expectedTs = task.timer_started_at;
+        if (!c || task.status !== "doing" || expectedTs === null
+          || Math.floor(Date.now() / 1000) - expectedTs < POMO_SECS) return;
+        // 捕获发起时的来源、行号、版本和 ts；成功/no-op 都重读权威数据，
+        // 因为只有 base_version 无法判断是否实际 +1。stale 沿用 edit 的重读路径，
+        // 后续 tick 只扫描新 TaskView，绝不拿旧行号配新版本重试。
+        await edit(async (snapshot) => {
+          try {
+            return await api.settlePomo(snapshot.notebookId, snapshot.kind,
+              snapshot.lineIdx, snapshot.baseVersion, expectedTs, snapshot.date);
+          } catch (error) {
+            if (error instanceof ApiError && error.code === "stale" && isCurrent(snapshot)
+              && app.view === view) {
+              // 重读完成前撤下旧数据，慢 IPC 时也不能重复扫描旧行号。
+              app.view = null;
+              rerender();
+            }
+            throw error;
+          }
+        }, c);
+      } finally {
+        pomoSettlements.delete(key);
+      }
+    })();
+  }, 0);
+}
 
 function tickTimers(): void {
-  const timers = root.querySelectorAll<HTMLElement>(".timer[data-timer-line]");
-  if (timers.length === 0) return;
+  const view = app.view;
+  if (!view) return;
   const now = Date.now();
-  for (const tm of timers) {
-    const t = app.view?.tasks[Number(tm.dataset.timerLine)];
-    if (!t) continue;
-    const text = formatHms(timerDisplaySecs(t, now));
-    const first = tm.firstChild;
-    if (first instanceof Text && first.data !== text) first.data = text;
+  for (const t of view.tasks) {
+    if (t.status !== "doing" || t.timer_started_at === null) continue;
+    const elapsed = Math.floor(now / 1000) - t.timer_started_at;
+    if (elapsed >= POMO_SECS && !deferPomoSettlement()) queuePomoSettlement(view, t);
+    if (document.hidden) continue;
+    const tm = root.querySelector<HTMLElement>(`.pomo-time[data-pomo-line="${t.row_idx}"]`);
+    const text = formatMmSs(timerDisplaySecs(t, now));
+    if (tm && tm.textContent !== text) tm.textContent = text;
   }
 }
 
 function hasTickingTimer(): boolean {
-  const now = Date.now();
   return !!app.view?.tasks.some(t =>
-    t.status === "doing" && t.timer_started_at !== null && timerDisplaySecs(t, now) < TIMER_CAP_SECS);
+    t.status === "doing" && t.timer_started_at !== null);
 }
 
 function syncTicker(): void {
-  const active = !document.hidden && hasTickingTimer();
+  const active = hasTickingTimer();
   if (active && tickerId === undefined) {
     tickerId = window.setInterval(tickTimers, 1000);
   } else if (!active && tickerId !== undefined) {
     window.clearInterval(tickerId);
     tickerId = undefined;
   }
-  if (!document.hidden) tickTimers(); // 含从后台标签恢复时的立即重算
+  tickTimers(); // 加载完成/恢复可见时立即扫描，不等下一秒；隐藏仍扫描。
 }
 
 document.addEventListener("visibilitychange", syncTicker);
@@ -699,6 +754,8 @@ function setBoardZoom(zoomed: boolean): void {
       isNew: boardEditor.isNew, typed: boardEditor.typed,
     };
     boardMask.hidden = true;
+    lastHeight = -1;
+    measureHeight();
     boardWindowChange = boardWindowChange.then(async () => {
       await api.setBoardWindow(true);
       if (pendingBoardZoom) await emit("board-zoom-open", pendingBoardZoom);
@@ -858,13 +915,20 @@ void listen<{ content: string; typed?: boolean }>("board-zoom-restore", ev => {
   if (!boardZoomed || !boardEditor) return;
   applyBoardZoomRestore(ev.payload.content, ev.payload.typed);
 });
+void listen<{ content: string; typed?: boolean }>("board-zoom-save", ev => {
+  if (!boardZoomed || !boardEditor) return;
+  applyBoardZoomRestore(ev.payload.content, ev.payload.typed);
+  void saveBoardEditor();
+});
 boardTitle.addEventListener("input", () => { if (boardEditor) boardEditor.typed = true; });
 boardArea.addEventListener("input", () => { if (boardEditor) boardEditor.typed = true; });
-// 标题行回车＝跳到正文（不换行不保存）；Ctrl+Enter 保存已由 boardMask 委托接管。
+// 标题行回车（含 Shift+Enter）＝跳到正文（不换行不保存），stopPropagation 阻断
+// boardMask 委托的 Enter 保存；Ctrl+Enter 保存仍由 boardMask 委托接管。
 boardTitle.addEventListener("keydown", ev => {
   if (ev.isComposing || ev.keyCode === 229) return;
   if (ev.key === "Enter" && !ev.ctrlKey && !ev.metaKey) {
     ev.preventDefault();
+    ev.stopPropagation();
     boardArea.focus();
     boardArea.setSelectionRange(0, 0);
   }
@@ -873,7 +937,7 @@ boardMask.addEventListener("click", ev => { if (ev.target === boardMask) void cl
 boardMask.addEventListener("keydown", ev => {
   if (ev.isComposing || ev.keyCode === 229) return;
   if (ev.key === "Escape") { ev.preventDefault(); ev.stopPropagation(); void closeBoardEditor(); }
-  else if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); ev.stopPropagation(); void saveBoardEditor(); }
+  else if (ev.key === "Enter" && !ev.shiftKey && (ev.target === boardTitle || ev.target === boardArea)) { ev.preventDefault(); ev.stopPropagation(); void saveBoardEditor(); }
 });
 new MutationObserver(() => {
   stickyPapers = readStickyPapers();
@@ -1464,8 +1528,7 @@ root.addEventListener("click", (ev) => {
       if (TOUCH_DEVICE) void refresh();
       break;
     case "check": {
-      // 行尾完成勾选框：勾=done 结算冻结；取消=复活回 paused 冻结不清零
-      // （v0.8.1：复活停暂停而非进行中，点状态钮才开始续计）。
+      // 行尾勾选：勾=done；取消=wire paused（闲置），保留番茄数。
       const t = taskAt(line);
       if (!t) break;
       const target = t.checked ? "paused" : "done";
@@ -1476,12 +1539,11 @@ root.addEventListener("click", (ev) => {
       break;
     }
     case "status": {
-      // 左侧状态钮：单击只在 待开始→进行中 / 进行中⇄暂停 间循环；完成态零 IPC。
+      // 仅闲置→开始；与 disabled 属性共同守住运行中/完成态零 IPC。
       const t = taskAt(line);
-      if (!t || t.status === "done") break;
-      const target = t.status === "doing" ? "paused" : "doing";
+      if (!t || (t.status !== "todo" && t.status !== "paused")) break;
       void (async () => {
-        const ok = await edit((c) => api.setStatus(c.notebookId, c.kind, c.lineIdx, target, c.baseVersion, c.date), context(line));
+        const ok = await edit((c) => api.setStatus(c.notebookId, c.kind, c.lineIdx, "doing", c.baseVersion, c.date), context(line));
         if (ok) focusTaskControl(t, ".st");
       })();
       break;
@@ -1690,12 +1752,12 @@ let heightTimer: number | undefined;
 let lastHeight = -1;
 
 function measureHeight(): void {
-  if (boardZoomed) return;
+  if (boardZoomed && !boardMask.hidden) return;
   if (boardWindowRestoring) return;
   if (TOUCH_DEVICE) return;
   window.clearTimeout(heightTimer);
   heightTimer = window.setTimeout(() => {
-    if (boardZoomed || boardWindowRestoring) return;
+    if ((boardZoomed && !boardMask.hidden) || boardWindowRestoring) return;
     // 量 #sticky 内容高：documentElement/body.scrollHeight 有 ≥客户区的
     // 隐性地板（scrollHeight ≥ clientHeight），窗口只会长高永不回缩；
     // 窗口改不透明后内容短时会露出空白面板尾，必须按内容真缩。

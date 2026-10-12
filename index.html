@@ -89,6 +89,10 @@
               <span id="font-size-label" aria-live="polite">13</span>
               <button id="font-up" type="button" title="放大字号" aria-label="放大字号">A⁺</button>
             </div>
+            <p class="version-row">版本 <span id="app-version">—</span> · <span id="update-status" role="status">…</span></p>
+            <button id="update-check" type="button" hidden>检查更新</button>
+            <label for="update-pat" hidden>更新令牌</label>
+            <input id="update-pat" type="password" placeholder="GitHub PAT（未配置 Git 凭据时填）" autocomplete="new-password" hidden>
             <p id="theme-status" role="status">仅保存在这台设备</p>
           </div>
         </details>
@@ -106,6 +110,7 @@
           <button id="board-zoom" type="button" title="放大" aria-label="放大">⤢</button>
         </div>
         <textarea id="board-area" placeholder="写点什么~" spellcheck="false"></textarea>
+        <div class="board-shortcuts">Enter 保存 <span aria-hidden="true">·</span> Shift+Enter 换行 <span aria-hidden="true">·</span> Esc 退出</div>
         <div class="board-zoom-resize" aria-hidden="true"></div>
       </div></div>
     </main>

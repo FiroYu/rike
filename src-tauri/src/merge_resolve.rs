@@ -37,7 +37,7 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::parser::{task_identity, three_way_merge_task_line};
+use crate::parser::{pomo_segment_key, task_identity, three_way_merge_task_line, TodoFile};
 
 /// 一个 unmerged 路径的三方字节。`base=None` 表示 add/add；
 /// `ours/theirs=None` 表示该侧删除（文件级 delete-vs-modify → 人工）。
@@ -92,12 +92,14 @@ fn resolve_one(s: &ConflictSides) -> Option<ResolvedFile> {
     }
     let (content, notes) = if is_task_semantic(&s.path) {
         let mut notes = Vec::new();
-        let lines = task_semantic_merge(
+        let mut lines = task_semantic_merge(
             &split_lines(base),
             &split_lines(ours),
             &split_lines(theirs),
             &mut notes,
         )?;
+        relocate_stranded_tasks(&mut lines, is_week_path(&s.path));
+        ensure_inner_newlines(&mut lines);
         (lines.concat().into_bytes(), notes)
     } else {
         let mut notes = Vec::new();
@@ -133,6 +135,59 @@ fn is_task_semantic(path: &str) -> bool {
     parts.len() >= 2
         && parts[parts.len() - 1].ends_with(".md")
         && matches!(parts[parts.len() - 2], "days" | "weeks")
+}
+
+/// 周文件判定（weeks/ 段）：决定错挂任务回插的目标段落名。
+fn is_week_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    normalized.split('/').any(|seg| seg == "weeks")
+}
+
+/// add/add 错挂修复（2026-10-09 实况）：双端离线各自新建同一日/周文件时，
+/// 任务块按 ours 序全部输出后、theirs 独有块追加在产物末尾——落在
+/// 「## 备注」/「## 下周计划 / 备注」等非任务段下。解析层把它们当任务
+/// 显示，但跨日流转不认这些段，任务因此永远滞留旧日期。这里把错挂段下
+/// 的任务块挪回：未勾选 → 日任务/本周任务末尾，已勾选 → 完成事项/已
+/// 完成末尾。认不出任务段或无错挂任务时原样返回——常见路径零改动。
+fn relocate_stranded_tasks(out: &mut Vec<String>, week: bool) {
+    let (task_sec, done_sec, homes): (&str, &str, &[&str]) = if week {
+        ("本周任务", "已完成", &["本周任务", "进行中", "已完成"])
+    } else {
+        ("日任务", "完成事项", &["日任务", "完成事项"])
+    };
+    let mut file = TodoFile::parse(&out.concat());
+    if file.section_flat_insert_at(task_sec).is_err() {
+        return; // 模板认不出任务段 → 不动，保住既有合并产物
+    }
+    let stranded: Vec<usize> = file.tasks.iter()
+        .filter(|t| !homes.contains(&t.section.as_str()))
+        .map(|t| t.line_idx)
+        .collect();
+    if stranded.is_empty() {
+        return;
+    }
+    // 降序删除避免行号漂移（delete_task 后内部重建），按原序回插
+    let mut blocks: Vec<(bool, Vec<String>)> = Vec::new();
+    for line_idx in stranded.into_iter().rev() {
+        let checked = file.tasks.iter()
+            .find(|t| t.line_idx == line_idx)
+            .is_some_and(|t| t.checked);
+        if let Ok(b) = file.delete_task(line_idx) {
+            blocks.push((checked, b));
+        }
+    }
+    for (checked, block) in blocks.into_iter().rev() {
+        let sec = if checked && file.section_flat_insert_at(done_sec).is_ok() {
+            done_sec
+        } else {
+            task_sec
+        };
+        if let Ok(at) = file.section_flat_insert_at(sec) {
+            file.insert_lines_at(at, block);
+        }
+    }
+    let lines = split_lines(&file.serialize());
+    *out = lines.into_iter().map(|l| format!("{}{}", l.text, l.eol)).collect();
 }
 
 // ── 行与块 ────────────────────────────────────────────────────────
@@ -243,6 +298,32 @@ fn lcs_matches(a: &[Blk], b: &[Blk]) -> Vec<Option<usize>> {
 
 // ── TaskSemantic 合并 ─────────────────────────────────────────────
 
+/// 正文改名会脱离内容身份键。仅同一 LCS 间隙各剩一个任务，且合法番茄段
+/// 未变时补配对，让另一端的结算进入行级合并；多候选与 legacy 不推断。
+fn match_pomo_renames(
+    base_blocks: &[Blk], side_blocks: &[Blk], base: &[Line], side: &[Line],
+    matches: &mut [Option<usize>],
+) {
+    let anchors: Vec<(usize, usize)> = matches.iter().enumerate()
+        .filter_map(|(i, &j)| j.map(|j| (i, j)))
+        .chain(std::iter::once((base_blocks.len(), side_blocks.len())))
+        .collect();
+    let (mut bi, mut si) = (0, 0);
+    for (be, se) in anchors {
+        if be - bi == 1 && se - si == 1 {
+            if let (Blk::Task { main: bm, .. }, Blk::Task { main: sm, .. }) =
+                (&base_blocks[bi], &side_blocks[si]) {
+                let key = pomo_segment_key(&base[*bm].text);
+                if key.is_some() && key == pomo_segment_key(&side[*sm].text) {
+                    matches[bi] = Some(si);
+                }
+            }
+        }
+        bi = be + 1;
+        si = se + 1;
+    }
+}
+
 fn task_semantic_merge(
     base: &[Line],
     ours: &[Line],
@@ -252,8 +333,10 @@ fn task_semantic_merge(
     let bb = split_blocks(base);
     let ob = split_blocks(ours);
     let tb = split_blocks(theirs);
-    let a = lcs_matches(&bb, &ob); // base → ours
-    let b = lcs_matches(&bb, &tb); // base → theirs
+    let mut a = lcs_matches(&bb, &ob); // base → ours
+    let mut b = lcs_matches(&bb, &tb); // base → theirs
+    match_pomo_renames(&bb, &ob, base, ours, &mut a);
+    match_pomo_renames(&bb, &tb, base, theirs, &mut b);
 
     let add_add_file = bb.is_empty();
     // add/add 文件里配对后双侧仍有剩余 → 人工（见模块注释）
@@ -668,6 +751,45 @@ fn prune_backups(dir: &Path) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn pomo_text_edit_and_settlement_merge_as_one_task() {
+        let base = "## 日任务\n- [ ] (P1) A #pomo 0 #doing #ts 100\n";
+        let renamed = "## 日任务\n- [ ] (P0) B #pomo 0 #doing #ts 100\n";
+        let settled = "## 日任务\n- [ ] (P1) A #pomo 1\n";
+        for (o, t) in [(renamed, settled), (settled, renamed)] {
+            let merged = resolved_content(&sides("days/2026-10-09.md", Some(base), o, t)).unwrap();
+            assert_eq!(merged, "## 日任务\n- [ ] (P0) B #pomo 1\n");
+        }
+    }
+
+    #[test]
+    fn pomo_priority_edit_and_next_segment_keep_new_start() {
+        let base = "- [ ] (P1) A #pomo 0 #doing #ts 100\n";
+        let ours = "- [ ] (P0) A #pomo 0 #doing #ts 100\n";
+        let theirs = "- [ ] (P1) A #pomo 1 #doing #ts 1600\n";
+        for (o, t) in [(ours, theirs), (theirs, ours)] {
+            let merged = resolved_content(&sides("days/2026-10-09.md", Some(base), o, t)).unwrap();
+            assert_eq!(merged, "- [ ] (P0) A #pomo 1 #doing #ts 1600\n");
+        }
+    }
+
+    #[test]
+    fn pomo_rename_does_not_guess_multiple_candidates_or_different_segments() {
+        let base = "- [ ] A #pomo 0 #doing #ts 100\n";
+        let settled = "- [ ] A #pomo 1\n";
+        for ours in [
+            "- [ ] B #pomo 0 #doing #ts 101\n",
+            "- [ ] B #pomo 0 #doing #ts 100\n- [ ] C #pomo 0 #doing #ts 100\n",
+        ] {
+            let merged = resolved_content(&sides("days/2026-10-09.md", Some(base), ours, settled)).unwrap();
+            assert!(merged.contains("- [ ] A #pomo 1\n"));
+            assert!(merged.contains("- [ ] B #pomo 0 #doing"));
+        }
+        let ours = "- [ ] B #pomo 0 #doing #ts 100\n";
+        let theirs = "- [ ] C #pomo 0 #doing #ts 100\n";
+        assert!(resolved_content(&sides("days/2026-10-09.md", Some(base), ours, theirs)).is_none());
+    }
+
     fn sides(path: &str, base: Option<&str>, ours: &str, theirs: &str) -> ConflictSides {
         ConflictSides {
             path: path.to_string(),
@@ -752,6 +874,62 @@ mod tests {
         let b = got.find("任务B").unwrap();
         let m = got.find("## 备注").unwrap();
         assert!(a < b && b < m, "任务B 应在日任务段内：\n{got}");
+    }
+
+    /// 2026-10-09 实况回归：双机离线各自新建同一日文件（本机 3 条、笔电 7 条），
+    /// ours 块全部配对、theirs 多出的任务块被追加到产物末尾——落在「## 备注」
+    /// 之后。解析层把它们当任务显示，但跨日流转只认任务段，任务永远滞留
+    /// 旧日期（用户次日发现昨天工作没搬运）。
+    #[test]
+    fn add_add_theirs_extra_tasks_join_day_task_section() {
+        let file = |n: usize| {
+            format!(
+                "# 2026-10-09 (周五)\n\n> 本日重点: \n\n## 日任务\n<!-- 追加格式: -->\n{}## 完成事项\n\n## 备注\n",
+                (0..n).map(|i| format!("- [ ] (P1) [工作] 任务{i}\n")).collect::<String>()
+            )
+        };
+        let got = resolved_content(&sides(
+            "notebooks/nb-x/days/2026-10-09.md",
+            None,
+            &file(3),
+            &file(7),
+        ))
+        .unwrap();
+        let task_sec = &got[..got.find("## 完成事项").unwrap()];
+        for i in 0..7 {
+            assert!(task_sec.contains(&format!("任务{i}")), "任务{i} 应在日任务段：\n{got}");
+        }
+        let notes = &got[got.find("## 备注").unwrap()..];
+        assert!(!notes.contains("- ["), "备注段不应残留任务行：\n{notes}");
+    }
+
+    /// 周文件同病：add/add 后 theirs 独有任务（含已勾选）不得落在
+    /// 「## 下周计划 / 备注」下；未勾选进本周任务，已勾选进已完成。
+    #[test]
+    fn add_add_week_stranded_tasks_rejoin_task_sections() {
+        let ours = "# 2026-W41\n\n## 本周任务\n- [ ] 周任务A\n\n## 进行中\n\n## 已完成\n\n## 下周计划 / 备注\n";
+        let theirs = "# 2026-W41\n\n## 本周任务\n- [ ] 周任务A\n- [ ] 周任务B\n- [x] 周任务C\n\n## 进行中\n\n## 已完成\n\n## 下周计划 / 备注\n";
+        let got = resolved_content(&sides(
+            "notebooks/nb-x/weeks/2026-W41.md",
+            None,
+            ours,
+            theirs,
+        ))
+        .unwrap();
+        let (b, c) = (got.find("周任务B").unwrap(), got.find("周任务C").unwrap());
+        let (done, plan) = (got.find("## 已完成").unwrap(), got.find("## 下周计划").unwrap());
+        assert!(b < done, "周任务B 应在本周任务段：\n{got}");
+        assert!(done < c && c < plan, "周任务C（已勾选）应在已完成段：\n{got}");
+    }
+
+    /// 认不出「## 日任务」段（如自定义模板）→ 不挪动、不失败，产物保持合并原样。
+    #[test]
+    fn day_without_task_section_keeps_merge_output() {
+        let ours = "# 笔记\n\n## 待办\n- [ ] A\n";
+        let theirs = "# 笔记\n\n## 待办\n- [ ] A\n- [ ] B\n";
+        let got = resolved_content(&sides("days/2026-10-09.md", Some(ours), ours, theirs));
+        let got = got.unwrap();
+        assert!(got.contains("- [ ] A") && got.contains("- [ ] B"), "产物应含双侧任务：\n{got}");
     }
 
     /// 同键任务的子行并集：ours 序 + theirs 独有追加。

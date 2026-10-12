@@ -204,6 +204,15 @@ unsafe fn move_to(hwnd: HWND, x: i32, y: i32) {
 unsafe fn settle(hwnd: HWND) {
     let Some(rect) = window_rect(hwnd) else { return };
     let work = work_of(hwnd);
+    let mut mi: MONITORINFO = std::mem::zeroed();
+    mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if !monitor.is_null()
+        && GetMonitorInfoW(monitor, &mut mi) != 0
+        && crate::edge_hide::is_hidden_signature(&rect, &work, &mi.rcMonitor)
+    {
+        return;
+    }
     let thr = (SNAP_LOGICAL as f64 * scale_of(hwnd)).round() as i32;
     let e = snap_edges(&rect, &work, thr);
     let (x, y) = snapped_pos(&rect, &work, e);
@@ -288,15 +297,25 @@ pub(crate) fn resize_anchored(hwnd: HWND, w_logical: f64, h_logical: f64) {
         let border_y = (r.bottom - r.top) - cr.bottom;
         let w = (w_logical * scale).round() as i32 + border_x;
         let h = (h_logical * scale).round() as i32 + border_y;
-        let Some(fitted) = fitted_resize(&r, w, h, &work_of(hwnd), ANCHOR_BOTTOM.load(Ordering::SeqCst)) else { return };
+        let work = work_of(hwnd);
+        let Some(fitted) = fitted_resize(&r, w, h, &work, ANCHOR_BOTTOM.load(Ordering::SeqCst)) else { return };
         let w = fitted.right - fitted.left;
         let h = fitted.bottom - fitted.top;
         let y = fitted.top;
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let x = if !monitor.is_null() && GetMonitorInfoW(monitor, &mut mi) != 0 {
+            crate::edge_hide::hidden_x_override(w, &work, &mi.rcMonitor)
+                .unwrap_or(fitted.left)
+        } else {
+            fitted.left
+        };
         eprintln!("[place] resize w={w_logical} h={h_logical} -> outer {w}x{h} at y={y} anchor_bottom={}", ANCHOR_BOTTOM.load(Ordering::SeqCst));
         SetWindowPos(
             hwnd,
             std::ptr::null_mut(),
-            fitted.left,
+            x,
             y,
             w,
             h,
@@ -414,6 +433,23 @@ mod tests {
         let unchanged = fitted_resize(&old, 580, 300, &work, false).unwrap();
         assert_eq!((unchanged.left, unchanged.top), (-600, -500));
         assert!(fitted_resize(&old, 580, 900, &rect(0, 0, 0, 0), true).is_none());
+    }
+
+    #[test]
+    fn ordinary_partly_offscreen_drag_is_not_hidden_signature() {
+        let work = rect(0, 0, 1920, 1040);
+        let mon = rect(0, 0, 1920, 1080);
+        let hidden = rect(-576, 200, 4, 700);
+        let dragged = rect(-80, 200, 500, 700);
+        assert!(matches!(
+            crate::edge_hide::classify(&hidden, &work, &mon, 2, 4, true),
+            crate::edge_hide::Where::DockedHidden(_)
+        ));
+        assert!(!matches!(
+            crate::edge_hide::classify(&dragged, &work, &mon, 2, 4, true),
+            crate::edge_hide::Where::DockedHidden(_)
+        ));
+        assert!(snap_edges(&dragged, &work, 24).left);
     }
 
 }

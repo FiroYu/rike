@@ -113,6 +113,11 @@ pub fn is_sunk() -> bool {
     SUNK.load(Ordering::SeqCst)
 }
 
+/// 是否正由全屏看门狗隐藏；边缘隐藏据此暂停，避免和 ShowWindow 恢复抢状态。
+pub(crate) fn is_hidden_by_fs() -> bool {
+    HIDDEN_BY_FS.load(Ordering::SeqCst)
+}
+
 /// F12 全屏自动隐藏（PRD）：前台应用整盖贴纸所在显示器（视频/游戏/演示）
 /// → 隐藏；退出全屏 ≤2s 恢复（1s 轮询）。只恢复自己隐藏的，不动唤起/沉回状态。
 pub fn spawn_fullscreen_watch(hwnd: HWND) {

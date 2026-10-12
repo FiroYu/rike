@@ -26,9 +26,15 @@ pub mod notes;
 pub mod stickies;
 pub mod parser;
 #[cfg(windows)]
+pub mod edge_hide;
+#[cfg(windows)]
 pub mod placement;
+#[cfg(target_os = "macos")]
+mod position;
 #[cfg(windows)]
 pub mod rollover;
+#[cfg(windows)]
+pub mod update;
 pub mod repo;
 pub mod sched;
 #[cfg(windows)]
@@ -49,6 +55,11 @@ use store::{CmdError, StoreState, StickyStore};
 const STICKY_W: f64 = 372.0;
 // Physical pixels throughout, matching Tauri's window and monitor geometry APIs.
 static BOARD_WINDOW_ZOOMED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(windows)]
+pub(crate) fn board_window_zoomed() -> bool {
+    BOARD_WINDOW_ZOOMED.load(Ordering::SeqCst)
+}
 
 fn board_editor_rect(area: tauri::PhysicalRect<i32, u32>) -> tauri::PhysicalRect<i32, u32> {
     const MARGIN: u32 = 28;
@@ -181,10 +192,21 @@ fn sticky_hwnd(app: &tauri::AppHandle) -> Option<windows_sys::Win32::Foundation:
 
 /// 沉回桌面层（前端 Esc / 5s 无操作调用）。
 #[tauri::command]
+#[cfg_attr(not(windows), allow(unused_variables))] // app 仅 Win32 sink 路径使用
 fn shell_sink(app: tauri::AppHandle) -> Result<(), CmdError> {
     #[cfg(windows)]
     if let Some(h) = sticky_hwnd(&app) {
         shell::sink(h);
+    }
+    #[cfg(not(windows))]
+    {
+        let w = app.get_webview_window("sticky")
+            .ok_or_else(|| CmdError::internal("sticky window does not exist"))?;
+        #[cfg(target_os = "macos")]
+        position::save(&w.as_ref().window())
+            .map_err(|e| CmdError::internal(format!("save sticky position failed: {e}")))?;
+        w.hide()
+            .map_err(|e| CmdError::internal(format!("hide sticky window failed: {e}")))?;
     }
     Ok(())
 }
@@ -448,6 +470,19 @@ fn set_status(
 }
 
 #[tauri::command]
+fn settle_pomo(
+    notebook_id: String,
+    kind: String,
+    date: Option<String>,
+    line_idx: usize,
+    base_version: String,
+    expected_ts: u64,
+    state: tauri::State<StoreState>,
+) -> Result<store::EditResult, CmdError> {
+    state.settle_pomo(&notebook_id, &view_kind(&kind, date.as_deref())?, line_idx, parse_bv(&base_version)?, expected_ts)
+}
+
+#[tauri::command]
 fn delete_task(
     notebook_id: String,
     kind: String,
@@ -548,6 +583,7 @@ fn machine_tag() -> String {
 
 /// 窗口壳装配：位置恢复/默认右下角（placement）→ 沉回桌面层 → 注册 Alt+S 全局
 /// 热键（设计方案 §0）。热键注册失败只记日志不崩（可能被其他程序占用）。
+#[cfg_attr(not(windows), allow(unused_variables))] // win 仅 Win32 壳路径使用
 fn setup_shell(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let Some(win) = app.get_webview_window("sticky") else {
         return Err("sticky 窗口未配置".into());
@@ -558,7 +594,24 @@ fn setup_shell(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         placement::init(h.0); // 恢复上次位置（无效则默认工作区右下角贴齐）
         shell::sink_to_bottom(h.0);
         shell::spawn_fullscreen_watch(h.0); // F12：前台全屏自动隐藏
+        edge_hide::spawn(h.0);
     }
+
+    #[cfg(target_os = "macos")]
+    position::init(&win.as_ref().window())?;
+
+    // mac 开机自启（W4）：每次启动重写 LaunchAgent plist——应用更新/换目录后
+    // 路径自愈；v1 无 UI 开关，手动移除登录项会在下次启动恢复。
+    #[cfg(target_os = "macos")]
+    {
+        use tauri_plugin_autostart::ManagerExt;
+        if let Err(e) = app.autolaunch().enable() {
+            eprintln!("[shell] enable autostart failed: {e}");
+        }
+    }
+
+    #[cfg(windows)]
+    update::spawn(app.handle().clone());
 
     #[cfg(desktop)]
     register_hotkey(app);
@@ -571,17 +624,29 @@ fn setup_shell(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 fn register_hotkey(app: &tauri::App) {
     use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
     let gs = app.global_shortcut();
-    if let Err(e) = gs.on_shortcut("alt+s", |app, _sc, event| {
-        if event.state != ShortcutState::Pressed {
-            return;
-        }
+    #[cfg(windows)]
+    let shortcut = "alt+s";
+    #[cfg(not(windows))]
+    let shortcut = "Command+Alt+S";
+    if let Err(e) = gs.on_shortcut(shortcut, |_app, _sc, event| {
+        let pressed = event.state == ShortcutState::Pressed;
         #[cfg(windows)]
-        if shell::is_sunk() {
-            if let Some(w) = app.get_webview_window("sticky") {
+        if pressed && shell::is_sunk() {
+            if let Some(w) = _app.get_webview_window("sticky") {
                 if let Ok(h) = w.hwnd() {
                     shell::summon(h.0);
                 }
                 let _ = w.set_focus();
+            }
+        }
+        #[cfg(not(windows))]
+        if pressed {
+            if let Some(w) = _app.get_webview_window("sticky") {
+                if let Err(e) = w.show() {
+                    eprintln!("[shell] show sticky window failed: {e}");
+                } else if let Err(e) = w.set_focus() {
+                    eprintln!("[shell] focus sticky window failed: {e}");
+                }
             }
         }
     }) {
@@ -591,6 +656,11 @@ fn register_hotkey(app: &tauri::App) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(windows)]
+    {
+        update::early_restarter();
+        update::cleanup_old();
+    }
     // tauri-runtime-wry 建窗/建 WebView 失败只走 log::error!，不装 logger 会静默吞错
     //（曾致 board-editor 窗口建不出来且无任何报错）——Error 级打到 stderr 以便排查。
     #[cfg(desktop)]
@@ -641,6 +711,7 @@ pub fn run() {
             set_priority,
             set_flag,
             set_status,
+            settle_pomo,
             set_content,
             delete_task,
             restore_deleted,
@@ -649,6 +720,10 @@ pub fn run() {
             sync_now,
             sync_config::get_sync_config,
             sync_config::set_sync_config,
+            #[cfg(windows)]
+            update::update_status,
+            #[cfg(windows)]
+            update::update_check_now,
             sync_status,
             machine_tag,
             shell_sink,
@@ -674,12 +749,24 @@ pub fn run() {
                     }
                 }
             }
+            // sticky 销毁即整体退出：board-editor 的关闭被拦截为 hide 永不销毁，
+            // 只关 sticky 时「最后一窗关闭」的 ExitRequested(code:None) 不会触发，
+            // 进程残留成僵尸——单实例回调拿不到 sticky，桌面快捷方式从此点不开
+            //（2026-10-07 实测命中）。主窗口即应用生命周期：Destroyed 主动走
+            // exit(0) → ExitRequested(code:Some(0)) 进入下方 flush 通道。
+            if window.label() == "sticky" {
+                if let tauri::WindowEvent::Destroyed = event {
+                    window.app_handle().exit(0);
+                }
+            }
             if let tauri::WindowEvent::Moved(_) = event {
                 if window.label() == "sticky" && !BOARD_WINDOW_ZOOMED.load(Ordering::SeqCst) {
                     #[cfg(windows)]
                     if let Ok(h) = window.hwnd() {
                         placement::note_moved(h.0);
                     }
+                    #[cfg(target_os = "macos")]
+                    position::note_moved(window);
                 }
             }
         })
@@ -691,6 +778,10 @@ pub fn run() {
         use tauri::Manager;
         if let Some(win) = app.get_webview_window("sticky") {
             let _ = win.show();
+            #[cfg(windows)]
+            if let Ok(h) = win.hwnd() {
+                edge_hide::ensure_shown(h.0);
+            }
             let _ = win.set_focus();
         }
     }));
@@ -698,6 +789,13 @@ pub fn run() {
     // 全局热键插件为桌面专属（见 register_hotkey）；移动端不挂载。
     #[cfg(desktop)]
     let builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
+
+    // mac 开机自启（W4）：LaunchAgent 方式；依赖仅 mac 目标引入，Win 构建不挂载。
+    #[cfg(target_os = "macos")]
+    let builder = builder.plugin(tauri_plugin_autostart::init(
+        tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+        None,
+    ));
 
     let app = builder
         .build(tauri::generate_context!())
@@ -724,9 +822,20 @@ pub fn run() {
     let mut sched = Some(sched);
     app.run(move |app_handle, event| {
         if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
-            if code.is_none() && !flushed {
+            #[cfg(target_os = "macos")]
+            if let Some(w) = app_handle.get_webview_window("sticky") {
+                if let Err(e) = position::save(&w.as_ref().window()) {
+                    eprintln!("[shell] save sticky position failed: {e}");
+                }
+            }
+            if !flushed {
                 flushed = true;
-                api.prevent_exit();
+                // code=None（最后一窗关闭）须 prevent 才有机会先跑 flush 再退出；
+                // code=Some(0)（sticky Destroyed 主动 exit(0)）已在退出途中，
+                // 再 prevent 反而取消退出变真僵尸。
+                if code.is_none() {
+                    api.prevent_exit();
+                }
                 app_handle.state::<StoreState>().detach_scheduler();
                 if let Some(s) = sched.take() {
                     s.stop(Duration::from_secs(15));

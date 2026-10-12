@@ -145,7 +145,9 @@ fn multi_day_multi_notebook_and_scope_boundaries() {
 #[test]
 fn preserves_fields_and_other_sections_stay() {
     let a = setup_repo("fields");
-    // 备注区任务：手工放置在 ## 备注 段的未勾选任务，不应被搬
+    // 备注区任务：语义合并曾把对端新增任务错挂到 ## 备注 段（2026-10-09
+    // 双机同日新建文件实况），段位在界面不可见、无法与正常任务区分，
+    // 流转口径与解析口径统一——未勾选任务一律搬运
     let mut text = day_file(&[
         "- [ ] (P0) [工作] 保留优先级 #doing",
         "- [ ] 保留无优先级 #blocked 等外部",
@@ -158,16 +160,16 @@ fn preserves_fields_and_other_sections_stay() {
 
     let store = StickyStore::new(a.clone());
     let report = carry_over(&store, d("2026-09-16")).unwrap();
-    assert_eq!(report.moved, 3, "仅 ## 日任务 段的未勾选任务搬运");
+    assert_eq!(report.moved, 4, "未勾选任务不限段位，备注段错挂任务一并搬运");
 
     let today = read(&a, "days/2026-09-16.md");
     assert!(today.contains("(P0) [工作] 保留优先级 #doing"), "优先级/分类/#doing 原样保留");
     assert!(today.contains("- [ ] 保留无优先级 #blocked 等外部"), "无优先级与 blocked 原因保留");
     assert!(today.contains("嵌套子行"));
-    assert!(!today.contains("备注区任务"), "其他章节的任务不动");
+    assert!(today.contains("备注区任务"), "备注段错挂任务搬入今日日任务");
     let yesterday = read(&a, "days/2026-09-15.md");
     assert!(yesterday.contains("已完成不搬"));
-    assert!(yesterday.contains("备注区任务"));
+    assert!(!yesterday.contains("备注区任务"));
 }
 
 #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.9.3"
+version = "0.10.0"
 description = "rike — desktop sticky todo with git sync"
 authors = ["FiroYu"]
 license = "MIT"
@@ -29,7 +29,7 @@ custom-protocol = ["tauri/custom-protocol"]
 gix = { version = "=0.87.1", default-features = false, features = ["sha1", "blocking-http-transport-reqwest", "status", "index", "worktree-mutation", "merge", "revision"] }
 # gix 聚合 crate 不透传 pack 的 generate feature——手写 push 需要 pack 写入能力,直接依赖 gix-pack(与 gix 0.87 内部版本一致)
 gix-pack = { version = "0.74", features = ["generate"] }
-reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls-no-provider"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls-no-provider", "system-proxy"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 webpki-roots = "1"
 tauri = { version = "2", features = [] }
@@ -38,9 +38,17 @@ serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 # log 门面全平台可用（host 无后端时宏为 no-op）；android_logger 仅在安卓注入后端
 log = "0.4"
+sha2 = "0.10"
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.15"
+
+# macOS 透明窗口（.transparent(true) 构建器方法）走私有 API：特性仅 mac 目标启用，
+# Win/Linux 不受影响；ad-hoc 分发无需 App Store 审核故可用。
+[target.'cfg(target_os = "macos")'.dependencies]
+tauri = { version = "2", features = ["macos-private-api"] }
+# mac 开机自启（W4）：仅 mac 目标引入，Win 构建不见此依赖
+tauri-plugin-autostart = "2"
 
 [dev-dependencies]
 tempfile = "3"
@@ -58,6 +66,7 @@ windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
     "Win32_Graphics_Gdi",
+    "Win32_System_Threading",
 ] }
 
 

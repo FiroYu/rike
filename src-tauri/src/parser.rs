@@ -5,17 +5,15 @@
 //! - 所有编辑只动目标 token 的字节区间，其余字节原样保留。
 //! - 往返保证：parse → serialize 与原文件字节一致（测试 G20）。
 //!
-//! 条目语法（v0.8 状态协议，与仓库 CLAUDE.md 一字不差）：
+//! 条目语法（v0.9.7 番茄钟协议）：
 //! ```text
-//! - [ ] (P1) [工作] 任务内容 #blocked 原因 #overdue #doing #t 3600 #ts 1758000000
+//! - [ ] (P1) [工作] 任务内容 #blocked 原因 #overdue #pomo 2 #doing #ts 1758000000
 //! ```
 //! - 分类标签：封闭词表 `[工作]`/`[个人]`，仅识别「checkbox+优先级前缀之后紧跟」的位置。
 //! - `#blocked` 后跟原因词（直到下一个 ` #` 或行尾）；`#overdue`/`#doing` 独立；
 //!   标签之后的非 `#` 文本为人工注记（如 `#overdue 补记9/2`），原样保留。
-//! - v0.8 计时标签：`#t N` 累计秒（一旦离开待开始即写入，零值不可省略）、
-//!   `#ts S` 本段计时起点（unix 秒，仅进行中存在）。规范落盘：
-//!   进行中 `[ ] … #doing #t N #ts S`；暂停 `[ ] … #paused #t N`；完成 `[x] … #t N`。
-//!   状态派生优先级：checked→完成 > #paused > #doing > 仅有 #t/#ts（非规范，按暂停）。
+//! - `#pomo N` 累计番茄数，初始化后保留零值；`#ts S` 是当前 25 分钟段起点。
+//!   闲置仅保留 #pomo，完成改勾选；旧 #t/#paused 只读兼容，状态手术时迁移。
 
 use serde::Serialize;
 
@@ -64,6 +62,8 @@ pub enum TaskStatus {
 
 /// 计时上限 99:59:59（秒）。累计与实时值均封顶，防止前端格式化越界。
 pub const TIMER_CAP_SECS: u64 = 359_999;
+pub const POMO_SECS: u64 = 1_500;
+pub const POMO_CAP: u64 = 65_535;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskView {
@@ -87,6 +87,10 @@ pub struct TaskView {
     pub timer_started_at: Option<u64>,
     /// `#t`/`#ts` 值无法解析为非负整数（按 0 参与计算；下次状态手术重写为合法值）
     pub timer_invalid: bool,
+    /// 已完成番茄数（legacy #t 按封顶前秒数折算）。
+    pub pomo_count: u64,
+    /// 存在 #pomo 或 legacy #t token，含非法值。
+    pub pomo_started: bool,
     /// 归属子行（缩进续行，如「老板要求: ...」）
     pub sub_lines: Vec<String>,
     /// 所在二级段（如「日任务」）
@@ -111,7 +115,7 @@ struct TagSpan {
     kind: FlagOrBlocked,
     span: (usize, usize),          // 标签本身（不含前导空格）
     reason: Option<(usize, usize)>, // #blocked 的原因词区间
-    /// #t/#ts 的数值文本区间（不含前导空格；非法文本同样记录，编辑时整体重写）
+    /// #t/#ts/#pomo 的数值文本区间（不含前导空格；非法文本同样记录）
     value: Option<(usize, usize)>,
 }
 
@@ -123,6 +127,7 @@ enum FlagOrBlocked {
     Paused,
     Time,
     TimeStart,
+    Pomo,
 }
 
 #[derive(Debug)]
@@ -139,7 +144,24 @@ struct ParsedLine {
     timer_base: u64,
     timer_started_at: Option<u64>,
     timer_invalid: bool,
+    pomo_count: u64,
+    pomo_started: bool,
+    pomo_invalid: bool,
     spans: Spans,
+}
+
+impl ParsedLine {
+    fn running(&self) -> bool {
+        self.status == TaskStatus::Doing && self.timer_started_at.is_some()
+    }
+
+    fn pomo_expired(&self, now: u64) -> bool {
+        self.running() && self.timer_started_at.is_some_and(|ts| now.saturating_sub(ts) >= POMO_SECS)
+    }
+
+    fn has_tag(&self, kind: FlagOrBlocked) -> bool {
+        self.spans.tags.iter().any(|t| t.kind == kind)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -176,7 +198,7 @@ fn is_heading(line: &str) -> Option<u8> {
 
 /// `#` 后跟哪个词表标签。`rest` 是 `#` 之后的文本，返回（种类，词长）。
 /// 旧词（overdue/doing/blocked）沿用历史规则：前缀匹配即标签（`#doingx` 亦识别，
-/// 不顺便重定义旧语法）；新词（paused/ts/t）要求词边界（行尾或空格），
+/// 不顺便重定义旧语法）；新词（paused/ts/t/pomo）要求词边界（行尾或空格），
 /// 否则 `#today` 会被 `#t` 吞掉。
 fn tag_kind_at(rest: &str) -> Option<(FlagOrBlocked, usize)> {
     let b = rest.as_bytes();
@@ -191,6 +213,8 @@ fn tag_kind_at(rest: &str) -> Option<(FlagOrBlocked, usize)> {
         Some((FlagOrBlocked::Paused, "paused".len()))
     } else if rest.starts_with("ts") && bounded("ts".len()) {
         Some((FlagOrBlocked::TimeStart, "ts".len()))
+    } else if rest.starts_with("pomo") && bounded("pomo".len()) {
+        Some((FlagOrBlocked::Pomo, "pomo".len()))
     } else if b.first() == Some(&b't') && bounded(1) {
         Some((FlagOrBlocked::Time, 1))
     } else {
@@ -285,7 +309,7 @@ fn parse_task_line(line: &str) -> Option<ParsedLine> {
                         reason = Some((rs, re_trim));
                         j = re_trim;
                     }
-                } else if matches!(kind, FlagOrBlocked::Time | FlagOrBlocked::TimeStart) {
+                } else if matches!(kind, FlagOrBlocked::Time | FlagOrBlocked::TimeStart | FlagOrBlocked::Pomo) {
                     // 数值：与原因词同规则扫描（下一个 " #" 或行尾），非法文本照记，
                     // 由派生层标记 invalid、下次状态手术整体重写。
                     let vs = skip_spaces(line, j);
@@ -363,12 +387,18 @@ fn parse_task_line(line: &str) -> Option<ParsedLine> {
     let mut timer_base: Option<u64> = None;
     let mut timer_started_at: Option<u64> = None;
     let mut timer_invalid = false;
+    let mut timer_raw = 0;
+    let mut pomo_count = 0;
+    let mut pomo_invalid = false;
     for t in &tags {
         match t.kind {
             FlagOrBlocked::Time => {
                 let raw = t.value.map(|(s, e)| &line[s..e]);
                 match raw.and_then(|v| v.parse::<u64>().ok()) {
-                    Some(n) => timer_base = Some(n.min(TIMER_CAP_SECS)),
+                    Some(n) => {
+                        timer_raw = n;
+                        timer_base = Some(n.min(TIMER_CAP_SECS));
+                    }
                     None => timer_invalid = true,
                 }
             }
@@ -379,22 +409,35 @@ fn parse_task_line(line: &str) -> Option<ParsedLine> {
                     None => timer_invalid = true,
                 }
             }
+            FlagOrBlocked::Pomo => {
+                let raw = t.value.map(|(s, e)| &line[s..e]);
+                match raw.and_then(|v| v.parse::<u64>().ok()) {
+                    Some(n) => pomo_count = n.min(POMO_CAP),
+                    None => pomo_invalid = true,
+                }
+            }
             _ => {}
         }
     }
     let timer_base = timer_base.unwrap_or(0);
+    let has_pomo = tags.iter().any(|t| t.kind == FlagOrBlocked::Pomo);
+    let has_time = tags.iter().any(|t| t.kind == FlagOrBlocked::Time);
+    let pomo_started = has_pomo || has_time;
+    if !has_pomo {
+        pomo_count = (timer_raw / POMO_SECS).min(POMO_CAP);
+    }
 
     // 状态派生（见模块注释的优先级表）
     let has_timer_tags = tags.iter().any(|t| {
-        matches!(t.kind, FlagOrBlocked::Time | FlagOrBlocked::TimeStart)
+        matches!(t.kind, FlagOrBlocked::Time | FlagOrBlocked::TimeStart | FlagOrBlocked::Pomo)
     });
     let status = if checked {
         TaskStatus::Done
     } else if paused {
         TaskStatus::Paused // doing+paused 并存显 Paused（人工合并文件的收敛方向）
-    } else if doing {
+    } else if doing && timer_started_at.is_some() {
         TaskStatus::Doing
-    } else if has_timer_tags {
+    } else if has_timer_tags || doing {
         TaskStatus::Paused // 仅有计时标签：非规范历史数据，按暂停解读（不丢累计）
     } else {
         TaskStatus::Todo
@@ -419,6 +462,9 @@ fn parse_task_line(line: &str) -> Option<ParsedLine> {
         timer_base,
         timer_started_at,
         timer_invalid,
+        pomo_count,
+        pomo_started,
+        pomo_invalid,
         spans: Spans { cb: cb_span, prio: prio_span, cat: cat_span, content: (content_start, content_end), tags },
     })
 }
@@ -457,7 +503,7 @@ fn trim_end_at(line: &str, end: usize) -> usize {
 /// - 拒绝换行：markdown 按行组织，注入 \n 会伪造任务行/标题行
 ///   （多行编辑走 sub_lines 参数，不从这里放开）；
 /// - 拒绝活标签词：与 tag_kind_at 相同的识别规则（行首/空格后跟
-///   #overdue/#doing/#blocked/#paused/#t/#ts），否则用户文本下次解析
+///   #overdue/#doing/#blocked/#paused/#t/#ts/#pomo），否则用户文本下次解析
 ///   变成真状态标签，#overdue/#t 还无法从 UI 移除。
 pub fn validate_user_text(text: &str) -> Result<(), String> {
     if text.contains(['\n', '\r']) {
@@ -470,7 +516,7 @@ pub fn validate_user_text(text: &str) -> Result<(), String> {
             && tag_kind_at(&text[i + 1..]).is_some()
         {
             return Err(
-                "内容不能包含 #overdue/#doing/#blocked/#paused/#t/#ts 状态标签".into(),
+                "内容不能包含 #overdue/#doing/#blocked/#paused/#t/#ts/#pomo 状态标签".into(),
             );
         }
     }
@@ -538,6 +584,8 @@ impl TodoFile {
                     timer_secs: p.timer_base,
                     timer_started_at: p.timer_started_at,
                     timer_invalid: p.timer_invalid,
+                    pomo_count: p.pomo_count,
+                    pomo_started: p.pomo_started,
                     sub_lines: Vec::new(),
                     section: section.clone(),
                     subsection: subsection.clone(),
@@ -604,6 +652,8 @@ impl TodoFile {
                 v.timer_secs = p.timer_base;
                 v.timer_started_at = p.timer_started_at;
                 v.timer_invalid = p.timer_invalid;
+                v.pomo_count = p.pomo_count;
+                v.pomo_started = p.pomo_started;
                 self.parsed[slot] = p;
             }
             None => { /* 行不再是任务：保守保留旧视图，调用方不应制造这种编辑 */ }
@@ -785,104 +835,111 @@ impl TodoFile {
         Ok(())
     }
 
-    /// v0.8 状态手术：把任务切到 target（todo 由命令层拒绝），now 为服务端 unix 秒
-    /// （整次手术只由调用方读一次时钟）。只动 checkbox、状态标签与计时标签的
-    /// 字节区间；`#overdue`/`#blocked`/注记原样保留，重复状态 token 全部清理：
-    /// - 结算：Doing → Paused/Done 时 `t = min(t + max(0, now-ts), CAP)`、删 ts
-    ///   （ts 缺失/非法则不加，时钟倒拨由 saturating_sub 保证 delta≥0）；
-    /// - 进行：任何 → Doing 保留 t、写 `ts=now`（幂等 Doing 不重设；遗留无 ts 补启）；
-    /// - 复活：Done → Doing 保留 t 冻结值从 now 续计；Done → Paused 保留冻结值停暂停
-    ///   （v0.8.1 取消勾选复活即停暂停，点状态钮才开始续计）；
-    /// - 一旦离开待开始必有 `#t`（零值不可省略）；Done 残留 ts 允许（幂等不清理）。
+    /// 番茄状态手术。now 由调用方持锁后读取；一个过期段只结算一个番茄。
     pub fn set_status_at(&mut self, line_idx: usize, target: TaskStatus, now: u64) -> Result<(), String> {
         if target == TaskStatus::Todo {
             return Err("待开始是一次性初始状态，不可恢复".into());
         }
         let slot = self.task_by_line(line_idx).ok_or("line 不是任务行")?;
-        let cur = self.parsed[slot].status;
-        if cur == target
-            && !(target == TaskStatus::Doing && self.parsed[slot].timer_started_at.is_none())
-        {
-            return Ok(()); // 同态幂等；唯一例外：Doing 遗留无 ts 走下面补启
+        let p = &self.parsed[slot];
+        let expired = p.pomo_expired(now);
+        let canonical = !p.has_tag(FlagOrBlocked::Time)
+            && !p.has_tag(FlagOrBlocked::Paused)
+            && !p.pomo_invalid
+            && !expired
+            && p.spans.tags.iter().filter(|t| t.kind == FlagOrBlocked::Pomo).count()
+                == usize::from(p.pomo_started)
+            && p.spans.tags.iter().filter(|t| t.kind == FlagOrBlocked::Doing).count()
+                == usize::from(p.running())
+            && p.spans.tags.iter().filter(|t| t.kind == FlagOrBlocked::TimeStart).count()
+                == usize::from(p.running())
+            && p.spans.tags.iter().all(|t| match t.kind {
+                FlagOrBlocked::Pomo => t.value.is_some_and(|(s, e)| {
+                    self.lines[line_idx][s..e] == p.pomo_count.to_string()
+                }),
+                FlagOrBlocked::TimeStart => t.value.is_some_and(|(s, e)| {
+                    self.lines[line_idx][s..e].parse::<u64>().ok() == p.timer_started_at
+                }),
+                _ => true,
+            });
+        if p.status == target && canonical && (target != TaskStatus::Doing || p.pomo_started) {
+            return Ok(());
         }
+        let count = p.pomo_count.saturating_add(u64::from(expired)).min(POMO_CAP);
+        let started = p.pomo_started || p.running() || target == TaskStatus::Doing;
+        self.rewrite_pomo(slot, count, started, (target == TaskStatus::Doing).then_some(now), target == TaskStatus::Done);
+        Ok(())
+    }
 
-        let line = self.lines[line_idx].clone();
-        let b = line.as_bytes();
-
-        // 结算值：base 为已落盘累计（派生时封顶/非法归零），Doing 才计增量
-        let base = self.parsed[slot].timer_base;
-        let delta = if cur == TaskStatus::Doing {
-            self.parsed[slot]
-                .timer_started_at
-                .map(|ts| now.saturating_sub(ts))
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        let settled = base.saturating_add(delta).min(TIMER_CAP_SECS);
-
-        // 所有编辑都使用原始行区间；删除状态标签后不重扫中间串。
-        let mut edits: Vec<(usize, usize, String)> = Vec::new();
-        let mut seen_t = false;
-        let mut replaced_t = false;
-        for t in &self.parsed[slot].spans.tags {
-            let removable = match t.kind {
-                FlagOrBlocked::Doing | FlagOrBlocked::Paused | FlagOrBlocked::TimeStart => true,
-                FlagOrBlocked::Time => {
-                    let first = !seen_t;
-                    seen_t = true;
-                    if first {
-                        if let Some((vs, ve)) = t.value {
-                            edits.push((vs, ve, settled.to_string()));
-                            replaced_t = true;
-                            continue;
-                        }
-                    }
-                    true // 重复或裸 #t 删除；裸标签在行尾补写带空格的数值
-                }
-                _ => false,
-            };
-            if removable {
-                let mut start = t.span.0;
-                if start > 0 && b[start - 1] == b' ' {
-                    start -= 1;
-                }
-                let end = t.value.map_or(t.span.1, |(_, ve)| ve.max(t.span.1));
+    /// 使用原始区间一次完成手术；优先保留数值标签锚点，避免注记进入 content。
+    fn rewrite_pomo(&mut self, slot: usize, count: u64, started: bool, ts: Option<u64>, checked: bool) {
+        let line_idx = self.tasks[slot].line_idx;
+        let line = &self.lines[line_idx];
+        let p = &self.parsed[slot];
+        let anchor = p.spans.tags.iter()
+            .find(|t| matches!(t.kind, FlagOrBlocked::Time | FlagOrBlocked::Pomo))
+            .or_else(|| p.spans.tags.iter().find(|t| matches!(t.kind,
+                FlagOrBlocked::Doing | FlagOrBlocked::Paused | FlagOrBlocked::TimeStart)))
+            .map(|t| t.span.0);
+        let mut edits = Vec::new();
+        for t in &p.spans.tags {
+            if !matches!(t.kind, FlagOrBlocked::Time | FlagOrBlocked::Pomo
+                | FlagOrBlocked::Doing | FlagOrBlocked::Paused | FlagOrBlocked::TimeStart) {
+                continue;
+            }
+            let end = t.value.map_or(t.span.1, |(_, e)| e);
+            if started && Some(t.span.0) == anchor {
+                edits.push((t.span.0, end, format!("#pomo {count}")));
+            } else {
+                let start = if t.span.0 > 0 && line.as_bytes()[t.span.0 - 1] == b' ' {
+                    t.span.0 - 1
+                } else {
+                    t.span.0
+                };
                 edits.push((start, end, String::new()));
             }
         }
-        edits.sort_unstable_by_key(|edit| edit.0);
+        edits.sort_by_key(|e| e.0);
         let mut out = String::with_capacity(line.len() + 32);
         let mut cursor = 0;
-        for (start, end, replacement) in edits {
-            out.push_str(&line[cursor..start]);
+        for (s, e, replacement) in edits {
+            out.push_str(&line[cursor..s]);
             out.push_str(&replacement);
-            cursor = end;
+            cursor = e;
         }
         out.push_str(&line[cursor..]);
-        if !replaced_t {
-            out.push_str(&format!(" #t {settled}"));
+        if started && anchor.is_none() {
+            out.push_str(&format!(" #pomo {count}"));
         }
-        match target {
-            TaskStatus::Doing => {
-                out.push_str(" #doing");
-                out.push_str(&format!(" #ts {now}"));
-            }
-            TaskStatus::Paused => out.push_str(" #paused"),
-            TaskStatus::Done => {}
-            TaskStatus::Todo => unreachable!("入口已拒绝"),
+        if let Some(ts) = ts {
+            out.push_str(&format!(" #doing #ts {ts}"));
         }
-
-        // checkbox：Done→x；Doing/Paused→空格（复活路径）。前缀未被上述手术触碰。
-        let (cs, ce) = self.parsed[slot].spans.cb;
-        if out.len() <= ce {
-            return Err("checkbox 区间非法".into());
-        }
-        out.replace_range(cs..ce, if target == TaskStatus::Done { "x" } else { " " });
-
+        let (s, e) = p.spans.cb;
+        out.replace_range(s..e, if checked { "x" } else { " " });
         self.lines[line_idx] = out;
         self.refresh(slot);
-        Ok(())
+    }
+
+    /// 段身份或到期条件失效时成功 no-op，供重复 ticker 请求安全重放。
+    pub fn settle_pomo_at(&mut self, line_idx: usize, expected_ts: u64, now: u64) -> bool {
+        let Some(slot) = self.task_by_line(line_idx) else { return false; };
+        let p = &self.parsed[slot];
+        if !p.pomo_expired(now) || p.timer_started_at != Some(expected_ts) {
+            return false;
+        }
+        let count = p.pomo_count.saturating_add(1).min(POMO_CAP);
+        self.rewrite_pomo(slot, count, true, None, false);
+        true
+    }
+
+    /// 删除前取消当前段；到期先结算，撤销块永不恢复 #doing/#ts。
+    pub fn delete_task_at(&mut self, line_idx: usize, now: u64) -> Result<Vec<String>, String> {
+        let slot = self.task_by_line(line_idx).ok_or("line 不是任务行")?;
+        let p = &self.parsed[slot];
+        let count = p.pomo_count.saturating_add(u64::from(p.pomo_expired(now))).min(POMO_CAP);
+        let started = p.pomo_started || p.running();
+        self.rewrite_pomo(slot, count, started, None, p.checked);
+        self.delete_task(line_idx)
     }
 
     /// 替换内容主体（保留前缀、标签、注记）。
@@ -1064,6 +1121,16 @@ pub(crate) fn task_identity(line: &str) -> Option<String> {
     parse_task_line(line).map(|p| p.content)
 }
 
+/// 仅合法番茄运行段可辅助识别改名；legacy 与缺起点数据不推断身份。
+pub(crate) fn pomo_segment_key(line: &str) -> Option<(u64, u64)> {
+    let p = parse_task_line(line)?;
+    if p.has_tag(FlagOrBlocked::Pomo) && p.running() && !p.pomo_invalid && !p.timer_invalid {
+        p.timer_started_at.map(|ts| (p.pomo_count, ts))
+    } else {
+        None
+    }
+}
+
 pub(crate) struct MergedTaskLine {
     pub line: String,
     pub notes: Vec<String>,
@@ -1072,49 +1139,40 @@ pub(crate) struct MergedTaskLine {
 /// 任务行三方语义合并。三方须为「同一任务」的三个版本（调用方 merge_resolve
 /// 按身份键＝内容＋子行配对，见 merge_resolve 模块注释）。
 ///
-/// 快路径：任两方字节相等 → 直接取第三方原文（零手术、字节保真）。
-/// 双改路径以 ours 原始行为底做字节区间手术（保 #overdue/#blocked 原因与
-/// 人工注记的原文），属性裁决全部朝「不丢」方向：
-/// - checked 或运算；状态三方裁决（单侧改动取动侧，双改取更高进度
-///   Done > Doing > Paused > Todo，doing 优先于 paused）
-/// - `#t` 取 max（TIMER_CAP 已在派生时封顶）；`#ts` 仅 Doing 保留（ours 优先）
-/// - 优先级/分类标准三方，双改不同取 ours + note
-/// - 内容主体（content）双改且不同 → None（真冲突，交人工）
-/// - theirs 独有的用户文本（注记尾段、受阻原因分歧）并入行尾，不丢记录
+/// 番茄计数按两侧相对 base 的增量相加，回退异常取三方 max；上限 65535。
+/// 运行段仅双侧仍运行时保留，起点取 max；同段双结算也按增量记 +2。
+/// 全 legacy 维持旧 #t max 及字节快路径，其余迁移到 #pomo（零值保留）。
+/// 文本、优先级、分类继续按三方裁决；注记在原始标签锚点之后保留。
 pub(crate) fn three_way_merge_task_line(
     base: Option<&str>,
     ours: &str,
     theirs: &str,
 ) -> Option<MergedTaskLine> {
-    // 快路径：字节比较零成本且免解析
-    if ours == theirs {
-        return Some(MergedTaskLine { line: ours.to_string(), notes: Vec::new() });
-    }
-    let bp = match base {
-        None => None, // add/add：双端各自新建的同键任务，无 base 参照
-        Some(b) => {
-            if b == theirs {
-                return Some(MergedTaskLine { line: ours.to_string(), notes: Vec::new() });
-            }
-            if b == ours {
-                return Some(MergedTaskLine { line: theirs.to_string(), notes: Vec::new() });
-            }
-            Some(parse_task_line(b)?) // base 行不是任务行 → 无法配对
-        }
-    };
-
+    let bp = match base { Some(b) => Some(parse_task_line(b)?), None => None };
     let op = parse_task_line(ours)?;
     let tp = parse_task_line(theirs)?;
-    // 内容主体双改且不同：同一任务的文案被两端改成两个方向 → 人工
-    if op.content != tp.content {
-        if bp.as_ref().is_some_and(|bp| bp.content == op.content) {
-            return Some(MergedTaskLine { line: theirs.to_string(), notes: Vec::new() });
-        }
-        if bp.as_ref().is_some_and(|bp| bp.content == tp.content) {
+    // 全 legacy 保留旧快路径与 #t max；混合或番茄数据必须执行增量裁决，
+    // 包括 ours == theirs（同段双结算按契约记 +2）。
+    let all_legacy = [&op, &tp].into_iter().chain(bp.iter()).all(|p| {
+        p.has_tag(FlagOrBlocked::Time) && !p.has_tag(FlagOrBlocked::Pomo)
+    });
+    if all_legacy {
+        if ours == theirs || base == Some(theirs) {
             return Some(MergedTaskLine { line: ours.to_string(), notes: Vec::new() });
         }
-        return None;
+        if base == Some(ours) {
+            return Some(MergedTaskLine { line: theirs.to_string(), notes: Vec::new() });
+        }
     }
+    let content = if op.content == tp.content {
+        &op.content
+    } else if bp.as_ref().is_some_and(|b| b.content == op.content) {
+        &tp.content
+    } else if bp.as_ref().is_some_and(|b| b.content == tp.content) {
+        &op.content
+    } else {
+        return None;
+    };
 
     let mut notes: Vec<String> = Vec::new();
 
@@ -1126,18 +1184,42 @@ pub(crate) fn three_way_merge_task_line(
         Some(bp) if op.checked == bp.checked => tp.checked,
         _ => op.checked || tp.checked,
     };
-    let status = match bp.as_ref() {
-        Some(bp) => three_way_status(bp.status, op.status, tp.status),
-        None => max_status(op.status, tp.status),
+    let initialized = op.pomo_started || tp.pomo_started || bp.as_ref().is_some_and(|p| p.pomo_started);
+    let base_count = bp.as_ref().map_or(0, |p| p.pomo_count);
+    let count = if all_legacy {
+        0 // legacy 路径只裁决秒数，不追加番茄回退注记。
+    } else if op.pomo_count < base_count || tp.pomo_count < base_count {
+        notes.push("番茄计数回退，按三方最大值合并".into());
+        base_count.max(op.pomo_count).max(tp.pomo_count)
+    } else {
+        base_count.saturating_add(op.pomo_count - base_count)
+            .saturating_add(tp.pomo_count - base_count).min(POMO_CAP)
+    };
+    let running = op.running() && tp.running();
+    let status = if all_legacy {
+        match bp.as_ref() {
+            Some(bp) => three_way_status(bp.status, op.status, tp.status),
+            None => max_status(op.status, tp.status),
+        }
+    } else if checked {
+        TaskStatus::Done
+    } else if running {
+        TaskStatus::Doing
+    } else if initialized {
+        TaskStatus::Paused
+    } else {
+        TaskStatus::Todo
     };
     let timer = op.timer_base.max(tp.timer_base);
-    let ts = if status == TaskStatus::Doing {
+    let ts = if status != TaskStatus::Doing {
+        None
+    } else if all_legacy {
         op.timer_started_at.or(tp.timer_started_at)
     } else {
-        None
+        op.timer_started_at.max(tp.timer_started_at)
     };
-    if op.timer_invalid || tp.timer_invalid {
-        notes.push("计时标签存在非法值，按现值取 max 合并".into());
+    if op.timer_invalid || tp.timer_invalid || op.pomo_invalid || tp.pomo_invalid {
+        notes.push("计时标签存在非法值，按合法派生值合并".into());
     }
     // 优先级/分类：标准三方（单侧改动取动侧，双改取 ours）
     let prio = match (bp.as_ref().and_then(|bp| bp.priority), op.priority, tp.priority) {
@@ -1170,14 +1252,16 @@ pub(crate) fn three_way_merge_task_line(
     let b = ours.as_bytes();
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
 
-    // 1) 状态标签手术（#doing/#paused/#t/#ts；重复 token 全清，手法同 set_status_at）。
+    // 1) 状态标签手术（含 #pomo，重复 token 全清）。
     //    #overdue/#blocked 与注记文本区间保留原文。
-    // 2) 追加段 tail：#t（离开 Todo 即必有）+ 状态标签 + theirs 加侧胜标签。
+    // 2) 番茄/legacy 数值与运行状态 + theirs 加侧胜标签。
     //    tail 在 ours 的首个状态标签处「原位替换」而非行尾追加——注记只在标签
     //    之后的空隙存在，行尾追加会把注记挤到新标签之前、被 content 吞掉
     //    （identity 键漂移）。无状态标签可替换时才退化为行尾追加。
     let mut tail = String::new();
-    if timer > 0 {
+    if !all_legacy && initialized {
+        tail.push_str(&format!(" #pomo {count}"));
+    } else if all_legacy && timer > 0 {
         // 最小形式：#t 0 是语义空值，不落盘（仅计时标签的历史行按 Paused
         // 解读，#paused 标签本身已足以派生同态）
         tail.push_str(&format!(" #t {timer}"));
@@ -1189,7 +1273,8 @@ pub(crate) fn three_way_merge_task_line(
                 tail.push_str(&format!(" #ts {ts}"));
             }
         }
-        TaskStatus::Paused => tail.push_str(" #paused"),
+        TaskStatus::Paused if all_legacy => tail.push_str(" #paused"),
+        TaskStatus::Paused => {},
         TaskStatus::Done => {}
         TaskStatus::Todo => {}
     }
@@ -1221,7 +1306,7 @@ pub(crate) fn three_way_merge_task_line(
         (None, Some(r)) if base_blocked.is_none() => {
             tail.push_str(&format!(" #blocked {r}"));
         }
-        (Some(_), Some(t)) if Some(t) != base_blocked.as_deref() => {
+        (Some(o), Some(t)) if o != t && Some(t) != base_blocked.as_deref() => {
             extra.push_str(&format!(" # 对端受阻原因：{t}"));
             notes.push(format!("#blocked 原因双端不同，取本机；对端原因「{t}」已并入行尾注记"));
         }
@@ -1240,7 +1325,7 @@ pub(crate) fn three_way_merge_task_line(
     for t in &op.spans.tags {
         if !matches!(
             t.kind,
-            FlagOrBlocked::Doing | FlagOrBlocked::Paused | FlagOrBlocked::Time | FlagOrBlocked::TimeStart
+            FlagOrBlocked::Doing | FlagOrBlocked::Paused | FlagOrBlocked::Time | FlagOrBlocked::TimeStart | FlagOrBlocked::Pomo
         ) {
             continue;
         }
@@ -1264,6 +1349,11 @@ pub(crate) fn three_way_merge_task_line(
         // 行尾并入 theirs 用户文本（注记/受阻原因分歧）；零长区间在行尾
         // 永不与其他编辑重叠，稳定排序保证落在 tail 之后
         edits.push((b.len(), b.len(), extra));
+    }
+
+    if content != &op.content {
+        let (s, e) = op.spans.content;
+        edits.push((s, e, content.clone()));
     }
 
     // 3) checkbox（区间在行首，不受尾部编辑影响）
@@ -1299,7 +1389,7 @@ pub(crate) fn three_way_merge_task_line(
     }
 
     // 区间全部基于 ours 原始行，排序后一次应用（稳定排序保追加序）
-    edits.sort_by_key(|e| e.0);
+    edits.sort_by_key(|e| (e.0, e.1));
     let mut out = String::with_capacity(ours.len() + 32);
     let mut cursor = 0usize;
     for (start, end, replacement) in &edits {
@@ -1316,7 +1406,11 @@ pub(crate) fn three_way_merge_task_line(
 
     // 产物必须仍是合法任务行且派生态符合裁决（防御）
     let check = parse_task_line(&out)?;
-    if check.checked != checked || check.status != status || check.content != op.content {
+    if check.checked != checked || check.status != status || check.content != *content {
+        return None;
+    }
+    if !all_legacy && (check.pomo_count != count || check.pomo_started != initialized
+        || check.running() != running || check.timer_started_at != ts) {
         return None;
     }
     Some(MergedTaskLine { line: out, notes })
@@ -1353,6 +1447,176 @@ fn cut_with_space(b: &[u8], end: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pomo_parse_boundaries_duplicates_and_legacy() {
+        for (tags, count, started, running) in [
+            ("", 0, false, false),
+            (" #t 1499", 0, true, false),
+            (" #t 1500", 1, true, false),
+            (" #t 360000", 240, true, false),
+            (" #t nope", 0, true, false),
+            (" #t 1500 #t bad #t 3000", 2, true, false),
+            (" #pomo", 0, true, false),
+            (" #pomo bad #t 360000", 0, true, false),
+            (" #pomo 2 #pomo bad #pomo 3", 3, true, false),
+            (" #pomo 0 #t 360000", 0, true, false),
+            (" #pomo 65536", POMO_CAP, true, false),
+            (" #pomo 18446744073709551615", POMO_CAP, true, false),
+            (" #pomo 0 #doing #ts 100", 0, true, true),
+            (" #pomo 0 #doing", 0, true, false),
+            (" #pomo 0 #doing #ts bad", 0, true, false),
+            (" #pomo 0 #ts 100", 0, true, false),
+            (" #pomo 0 #doing #ts bad #ts 100", 0, true, true),
+        ] {
+            let line = format!("- [ ] A{tags}");
+            let p = parse_task_line(&line).unwrap();
+            assert_eq!((p.pomo_count, p.pomo_started, p.running()), (count, started, running), "{line}");
+            let f = TodoFile::parse(&line);
+            assert_eq!(f.tasks[0].pomo_count, count);
+            assert_eq!(f.tasks[0].pomo_started, started);
+            assert_eq!(f.tasks[0].content, "A");
+            assert_eq!(f.tasks[0].display, "A");
+            assert_eq!(f.serialize(), line);
+        }
+        assert!(parse_task_line("- [ ] A #pomo bad #pomo 2").unwrap().pomo_invalid);
+        assert!(!parse_task_line("- [ ] A #pomo 65536").unwrap().pomo_invalid);
+        assert_eq!(parse_task_line("- [ ] A #t 360000").unwrap().timer_base, TIMER_CAP_SECS);
+        assert!(validate_user_text("A #pomo 2").is_err());
+        assert!(validate_user_text("A #pomodoro").is_ok());
+    }
+
+    #[test]
+    fn pomo_status_surgery_matrix() {
+        for (tags, initial, expired) in [
+            ("", 0, false),
+            (" #t 360000 注记", 240, false),
+            (" #pomo 2 #doing #ts 100", 2, true),
+            (" #pomo 2 #doing #ts 1500", 2, false),
+            (" #t 1500 #t 3000 #paused #doing #ts 100 #ts 100", 2, false),
+            (" #pomo #doing #ts", 0, false),
+            (" #pomo 2 #doing", 2, false),
+            (" #pomo 2 #doing #ts bad", 2, false),
+            (" #pomo 2 #ts 100", 2, false),
+            (" #pomo 65535 #doing #ts 100", POMO_CAP, true),
+        ] {
+            for target in [TaskStatus::Doing, TaskStatus::Done, TaskStatus::Paused] {
+                let mut f = TodoFile::parse(&format!("- [ ] (P1) [工作] A{tags}\r\n  子行\r\n"));
+                f.set_status_at(0, target, 1600).unwrap();
+                let expected = (initial + u64::from(expired)).min(POMO_CAP);
+                assert_eq!(f.tasks[0].pomo_count, expected, "{tags} -> {target:?}");
+                assert_eq!(f.tasks[0].checked, target == TaskStatus::Done);
+                let expected_ts = if tags == " #pomo 2 #doing #ts 1500" { 1500 } else { 1600 };
+                assert_eq!(f.tasks[0].timer_started_at, (target == TaskStatus::Doing).then_some(expected_ts));
+                assert_eq!(f.tasks[0].pomo_started, !tags.is_empty() || target == TaskStatus::Doing);
+                let p = &f.parsed[0];
+                assert!(!p.has_tag(FlagOrBlocked::Time) && !p.has_tag(FlagOrBlocked::Paused));
+                assert_eq!(p.spans.tags.iter().filter(|t| t.kind == FlagOrBlocked::Pomo).count(), usize::from(f.tasks[0].pomo_started));
+                assert_eq!(f.tasks[0].content, "A");
+                if tags.contains("注记") {
+                    assert_eq!(f.tasks[0].display, "A 注记");
+                    assert!(f.lines[0].contains("#pomo 240 注记"));
+                    f.set_content(0, "B").unwrap();
+                    assert_eq!(f.tasks[0].display, "B 注记");
+                }
+                assert_eq!(f.lines[1], "  子行");
+                assert!(f.serialize().ends_with("\r\n"));
+            }
+        }
+    }
+
+    #[test]
+    fn pomo_same_status_only_short_circuits_canonical_unexpired_lines() {
+        let mut f = TodoFile::parse("- [ ] A #pomo 0 #doing #ts 100\n");
+        let original = f.serialize();
+        f.set_status_at(0, TaskStatus::Doing, 1599).unwrap();
+        assert_eq!(f.serialize(), original);
+        f.set_status_at(0, TaskStatus::Doing, 1600).unwrap();
+        assert_eq!(f.lines[0], "- [ ] A #pomo 1 #doing #ts 1600");
+        f.set_status_at(0, TaskStatus::Doing, 1600).unwrap();
+        assert_eq!(f.tasks[0].pomo_count, 1);
+        for line in ["- [x] A #t 1500 #paused #ts 100", "- [x] A #pomo 1 #doing #ts 100"] {
+            let mut f = TodoFile::parse(line);
+            f.set_status_at(0, TaskStatus::Done, 1600).unwrap();
+            assert_eq!(f.lines[0], "- [x] A #pomo 1");
+        }
+    }
+
+    #[test]
+    fn pomo_settlement_checks_identity_expiry_and_is_idempotent() {
+        let mut f = TodoFile::parse("- [ ] A #pomo 0 #doing #ts 100\n");
+        let original = f.serialize();
+        for (line, ts, now) in [(99, 100, 1600), (0, 101, 1600), (0, 100, 1599), (0, 100, 99)] {
+            assert!(!f.settle_pomo_at(line, ts, now));
+            assert_eq!(f.serialize(), original);
+        }
+        assert!(f.settle_pomo_at(0, 100, 1600));
+        assert_eq!(f.lines[0], "- [ ] A #pomo 1");
+        assert!(!f.settle_pomo_at(0, 100, 3100));
+        for line in ["- [ ] A #pomo 0 #doing", "- [ ] A #pomo 0 #ts 100", "- [x] A #pomo 0 #doing #ts 100"] {
+            let mut f = TodoFile::parse(line);
+            assert!(!f.settle_pomo_at(0, 100, 1600));
+        }
+        let mut f = TodoFile::parse("- [ ] A #pomo 65535 #doing #ts 100");
+        assert!(f.settle_pomo_at(0, 100, u64::MAX));
+        assert_eq!(f.tasks[0].pomo_count, POMO_CAP);
+    }
+
+    #[test]
+    fn pomo_delete_restore_keeps_count_and_cancels_segment() {
+        for (now, count) in [(1599, 2), (1600, 3)] {
+            let mut f = TodoFile::parse("- [ ] A #pomo 2 #doing #ts 100\n  子行\n- [ ] B\n");
+            let block = f.delete_task_at(0, now).unwrap();
+            assert_eq!(block, vec![format!("- [ ] A #pomo {count}"), "  子行".into()]);
+            f.insert_lines_at(0, block);
+            assert_eq!(f.tasks[0].status, TaskStatus::Paused);
+            assert_eq!(f.tasks[0].timer_started_at, None);
+            assert_eq!(f.tasks[0].pomo_count, count);
+        }
+    }
+
+    #[test]
+    fn pomo_coupled_merge_matrix_and_swapped_sides() {
+        // 同段双结算刻意记 +2：冻结契约采用增量相加，未按段去重。
+        for (base, ours, theirs, count, ts) in [
+            ("#pomo 0 #doing #ts 100", "#pomo 1", "#pomo 1", 2, None),
+            ("#pomo 0", "#pomo 1", "#pomo 1", 2, None),
+            ("#pomo 0 #doing #ts 100", "#pomo 0 #doing #ts 100", "#pomo 1 #doing #ts 1600", 1, Some(1600)),
+            ("#pomo 0 #doing #ts 100", "#pomo 1", "#pomo 1 #doing #ts 1600", 2, None),
+            ("#t 1500", "#pomo 2", "#t 3000", 3, None),
+            ("#pomo 3", "#pomo 2", "#pomo 4", 4, None),
+            ("#pomo 65534", "#pomo 65535", "#pomo 65535", POMO_CAP, None),
+            ("#pomo 0", "#pomo 0", "#pomo 0", 0, None),
+        ] {
+            let base = format!("- [ ] (P1) A {base}");
+            let ours = format!("- [ ] (P0) A {ours}");
+            let theirs = format!("- [ ] (P1) A {theirs}");
+            for (o, t) in [(&ours, &theirs), (&theirs, &ours)] {
+                let m = three_way_merge_task_line(Some(&base), o, t).unwrap();
+                let p = parse_task_line(&m.line).unwrap();
+                assert_eq!((p.pomo_count, p.timer_started_at), (count, ts), "{}", m.line);
+                assert!(p.pomo_started);
+                assert_eq!(p.priority, Some(Priority::P0));
+                assert!(!p.has_tag(FlagOrBlocked::Time) && !p.has_tag(FlagOrBlocked::Paused));
+            }
+        }
+    }
+
+    #[test]
+    fn pomo_merge_text_edit_and_settlement_are_both_retained() {
+        let base = "- [ ] (P1) A #pomo 0 #doing #ts 100 注记";
+        let ours = "- [ ] (P0) B #pomo 0 #doing #ts 100 注记";
+        let theirs = "- [ ] (P1) A #pomo 1 注记";
+        for (o, t) in [(ours, theirs), (theirs, ours)] {
+            let m = three_way_merge_task_line(Some(base), o, t).unwrap();
+            let p = parse_task_line(&m.line).unwrap();
+            assert_eq!(p.content, "B");
+            assert_eq!(p.display, "B 注记");
+            assert_eq!(p.priority, Some(Priority::P0));
+            assert_eq!(p.pomo_count, 1);
+            assert!(!p.running());
+        }
+    }
 
     #[test]
     fn clearing_absent_category_preserves_line_without_refresh() {
@@ -1399,26 +1663,19 @@ mod tests {
         assert_eq!(f.tasks[0].sub_lines, vec!["子行一：原备注甲", "子行二：原备注乙"]);
     }
 
-    /// 外部手写裸 `#t`（无值，UI 不可达）：结算须剥除后追加 ` #t N`——
-    /// 原地粘数会成 `#t3600`，下次按整词扫描读作未知标签，计时归零。
-    /// 结算值是派生量：裸 #t 读侧计 0，delta = now - ts = 3660 - 60 = 3600。
     #[test]
     fn bare_time_tag_settles_with_spaced_value() {
-        let mut f = TodoFile::parse("## 日任务\n- [ ] (P1) [工作] 裸标签样本 #doing #ts 60 #t\n");
-        f.set_status_at(1, TaskStatus::Done, 3660).unwrap();
-        assert_eq!(f.lines[1], "- [x] (P1) [工作] 裸标签样本 #t 3600");
-        // 回读仍是带值 #t（裸 #t 读侧按非法计 0，此处应为结算值）
-        let reparsed = TodoFile::parse("## 日任务\n- [x] (P1) [工作] 裸标签样本 #t 3600\n");
-        assert_eq!(reparsed.tasks[0].timer_secs, 3600);
-        assert_eq!(reparsed.tasks[0].status, TaskStatus::Done);
+        let mut f = TodoFile::parse("- [ ] 裸标签样本 #doing #ts 60 #t\n");
+        f.set_status_at(0, TaskStatus::Done, 3660).unwrap();
+        assert_eq!(f.lines[0], "- [x] 裸标签样本 #pomo 1");
+        assert_eq!(f.tasks[0].pomo_count, 1);
     }
 
-    /// 裸 `#t` 叠加 `#doing` 转 Paused：状态标签剥除 + 计时落带空格值，一次手术完成。
     #[test]
-    fn bare_time_tag_with_doing_settles_to_paused() {
-        let mut f = TodoFile::parse("## 日任务\n- [ ] (P1) [工作] 裸标签续跑 #doing #t\n");
-        f.set_status_at(1, TaskStatus::Paused, 500).unwrap();
-        assert_eq!(f.lines[1], "- [ ] (P1) [工作] 裸标签续跑 #t 0 #paused");
+    fn bare_time_tag_with_doing_cleans_to_idle() {
+        let mut f = TodoFile::parse("- [ ] 裸标签续跑 #doing #t\n");
+        f.set_status_at(0, TaskStatus::Paused, 500).unwrap();
+        assert_eq!(f.lines[0], "- [ ] 裸标签续跑 #pomo 0");
     }
 
     /// 标签值区间不得漏成注记：`#t 45` 的 45、`#ts` 的时间戳不进 display；
@@ -1434,17 +1691,12 @@ mod tests {
         assert_eq!(f.tasks[1].display, "带真注记 补记9/2");
     }
 
-    /// v0.8.1 复活语义：取消完成勾选（UI check 分支 target=paused）→ 复选框翻回、
-    /// #t 冻结值保留、落 #paused 无 #ts（点状态钮才开始续计，不再直接回 doing）。
-    /// done 行无 #ts → delta=0，settled 即原 #t 终值。
     #[test]
-    fn done_revives_to_paused_frozen() {
-        let mut f = TodoFile::parse("## 日任务\n- [x] (P1) [工作] 完成样本 #t 120\n");
-        f.set_status_at(1, TaskStatus::Paused, 999).unwrap();
-        assert_eq!(f.lines[1], "- [ ] (P1) [工作] 完成样本 #t 120 #paused");
-        let reparsed = TodoFile::parse("## 日任务\n- [ ] (P1) [工作] 完成样本 #t 120 #paused\n");
-        assert_eq!(reparsed.tasks[0].timer_secs, 120);
-        assert_eq!(reparsed.tasks[0].status, TaskStatus::Paused);
+    fn done_revives_to_idle_and_migrates_legacy() {
+        let mut f = TodoFile::parse("- [x] 完成样本 #t 1500\n");
+        f.set_status_at(0, TaskStatus::Paused, 999).unwrap();
+        assert_eq!(f.lines[0], "- [ ] 完成样本 #pomo 1");
+        assert_eq!(f.tasks[0].status, TaskStatus::Paused);
     }
 
     // ── 冲突自动合并（v0.8.6）行级三方合并 T-P ─────────────────────
@@ -1466,12 +1718,12 @@ mod tests {
     #[test]
     fn merge_base_equals_theirs_keeps_ours() {
         let m = three_way_merge_task_line(
-            Some("- [ ] 任务A"),
-            "- [ ] 任务A #paused 本机补记",
-            "- [ ] 任务A",
+            Some("- [ ] 任务A #pomo 0"),
+            "- [ ] 任务A #pomo 0 本机补记",
+            "- [ ] 任务A #pomo 0",
         )
         .unwrap();
-        assert_eq!(m.line, "- [ ] 任务A #paused 本机补记");
+        assert_eq!(m.line, "- [ ] 任务A #pomo 0 本机补记");
         assert!(m.notes.is_empty());
     }
 
@@ -1484,7 +1736,7 @@ mod tests {
             "- [x] 任务A #t 300",
         )
         .unwrap();
-        assert_eq!(m.line, "- [x] 任务A #t 300");
+        assert_eq!(m.line, "- [x] 任务A #pomo 0");
     }
 
     /// 状态双改不同方向（本机完成/对端进行中）→ 更高进度 Done 胜出，
@@ -1560,7 +1812,7 @@ mod tests {
             "- [ ] (P0) 任务A",
         )
         .unwrap();
-        assert_eq!(m.line, "- [ ] (P0) 任务A #t 10 #paused");
+        assert_eq!(m.line, "- [ ] (P0) 任务A #pomo 0");
     }
 
     /// 分类单侧改动（对端加 [工作]）→ 采纳对端。
@@ -1572,7 +1824,7 @@ mod tests {
             "- [ ] [工作] 任务A",
         )
         .unwrap();
-        assert_eq!(m.line, "- [ ] [工作] 任务A #t 5 #paused");
+        assert_eq!(m.line, "- [ ] [工作] 任务A #pomo 0");
     }
 
     /// 优先级双改不同 → 取本机 + note 留档。
@@ -1593,12 +1845,12 @@ mod tests {
     #[test]
     fn merge_annotation_survives_tag_surgery() {
         let m = three_way_merge_task_line(
-            Some("- [ ] 任务A"),
-            "- [ ] 任务A #doing 补记9/2",
-            "- [ ] 任务A #paused",
+            Some("- [ ] 任务A #pomo 0"),
+            "- [ ] 任务A #pomo 0 #doing #ts 10 补记9/2",
+            "- [ ] 任务A #pomo 0",
         )
         .unwrap();
-        assert_eq!(m.line, "- [ ] 任务A #doing 补记9/2");
+        assert_eq!(m.line, "- [ ] 任务A #pomo 0 补记9/2");
         // 回读验证注记仍是注记、content 不变
         let f = TodoFile::parse(&format!("## 日任务\n{}\n", m.line));
         assert_eq!(f.tasks[0].display, "任务A 补记9/2");

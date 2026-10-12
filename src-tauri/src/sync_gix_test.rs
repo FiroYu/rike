@@ -392,7 +392,11 @@ impl MockServer {
                 for _ in 0..count {
                     let mut stream = loop {
                         match listener.accept() {
-                            Ok((stream, _)) => break stream,
+                            // Windows：accept 出的流继承监听者的非阻塞模式（Unix 不继承），
+                            // 请求字节未到时 read_line 立即回 10035(WSAEWOULDBLOCK) 而非等
+                            // 5s 超时——慢机器上 accept 赢客户端 send 的竞态即 mock 报错。
+                            // 切回阻塞；读写超时由 read_request 设置。
+                            Ok((stream, _)) => { stream.set_nonblocking(false)?; break stream; }
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
                             Err(e) => return Err(e.into()),
                         }

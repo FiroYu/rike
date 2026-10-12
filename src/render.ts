@@ -1,6 +1,6 @@
 /** 纯渲染：状态 → DOM。无副作用、无 invoke；交互由 main.ts 事件委托处理。 */
 
-import type { Category, LeftoversDto, Notebook, NotesDto, SyncState, TaskStatus, TaskView, ViewKind } from "./api";
+import type { Category, LeftoversDto, Notebook, NotesDto, SyncState, TaskView, ViewKind } from "./api";
 
 const WEEKDAY_CN = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
 export const TOUCH_DEVICE = window.matchMedia('(hover: none)').matches;
@@ -36,32 +36,23 @@ const PRIO_CLASS: Record<string, string> = { P0: "p0", P1: "p1", P2: "p2", P3: "
 // 显示序键：优先级 P0→P3→无；无优先级排最后（rank=4）。
 const PRIORITY_RANK: Record<string, number> = { P0: 0, P1: 1, P2: 2, P3: 3 };
 
-/** v0.8 状态四态文案与符号（与 Rust TIMER_CAP_SECS 同值的展示上限）。 */
-export const TIMER_CAP_SECS = 359999;
-const STATUS_LABEL: Record<TaskStatus, string> = { todo: "待开始", doing: "进行中", paused: "暂停", done: "完成" };
-const ST_SYMBOL: Record<TaskStatus, string> = { todo: "○", doing: "▶", paused: "‖", done: "○" };
-const ST_TITLE: Record<TaskStatus, string> = {
-  todo: "点击开始（→ 进行中）",
-  doing: "点击暂停",
-  paused: "点击继续",
-  done: "完成（取消行尾勾选复活，回暂停）",
-};
+/** 与后端 POMO_SECS 一致：到期停在 25:00，等待结算。 */
+export const POMO_SECS = 1500;
 
-/** 计时显示值 = 已结算累计 + 进行中增量（时钟倒拨取 0），封顶 99:59:59。 */
+/** 只显示当前段；闲置/完成为零，时钟倒拨取零。 */
 export function timerDisplaySecs(task: TaskView, nowMs: number): number {
   const delta = task.status === "doing" && task.timer_started_at !== null
     ? Math.max(0, Math.floor(nowMs / 1000) - task.timer_started_at)
     : 0;
-  return Math.min(task.timer_secs + delta, TIMER_CAP_SECS);
+  return Math.min(delta, POMO_SECS);
 }
 
-/** 固定八位 HH:MM:SS 等宽展示。 */
-export function formatHms(totalSecs: number): string {
-  const s = Math.min(Math.max(Math.trunc(totalSecs), 0), TIMER_CAP_SECS);
-  const h = String(Math.floor(s / 3600)).padStart(2, "0");
-  const m = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
+/** MM:SS，两位分秒。 */
+export function formatMmSs(totalSecs: number): string {
+  const s = Math.min(Math.max(Math.trunc(totalSecs), 0), POMO_SECS);
+  const m = String(Math.floor(s / 60)).padStart(2, "0");
   const x = String(s % 60).padStart(2, "0");
-  return `${h}:${m}:${x}`;
+  return `${m}:${x}`;
 }
 
 export interface FoldState {
@@ -144,15 +135,16 @@ function renderTask(task: TaskView, showSource: boolean): HTMLElement {
   bar.setAttribute("aria-label", `切换优先级：${task.priority ?? "未设置"}`);
   item.append(bar);
 
-  // 左侧状态钮（v0.8 四态合一）：单击循环只在进行中⇄暂停；完成态禁点（复活走行尾勾选框）。
+  // 只负责开始；后端 paused 与 todo 同为可开始的闲置态。
   const st = el("button", "st");
-  const stMark = el("span", "st-mark", ST_SYMBOL[task.status]);
+  const stMark = el("span", "st-mark", task.status === "doing" ? "▶" : "○");
   stMark.setAttribute("aria-hidden", "true");
   st.append(stMark);
   st.dataset.action = "status";
-  st.title = ST_TITLE[task.status];
-  st.setAttribute("aria-label", `状态：${STATUS_LABEL[task.status]}`);
-  if (task.status === "done") st.setAttribute("aria-disabled", "true");
+  st.title = task.status === "doing" ? "番茄钟运行中"
+    : task.status === "done" ? "已完成（取消勾选后可开始番茄钟）" : "开始番茄钟";
+  st.setAttribute("aria-label", st.title);
+  st.disabled = task.status === "doing" || task.status === "done";
   item.append(st);
 
   const body = el("div", "body");
@@ -172,11 +164,23 @@ function renderTask(task: TaskView, showSource: boolean): HTMLElement {
     });
   }
   line.append(txt);
-  // 待开始不显示计时；一旦离开初始态 00:00:00 也显示（离开即落 #t 0）。
-  if (task.status !== "todo") {
-    const tm = el("span", "timer", formatHms(timerDisplaySecs(task, Date.now())));
-    tm.dataset.timerLine = String(task.row_idx);
-    line.append(tm);
+  if (task.pomo_started === true) {
+    const pomo = el("span", "pomo");
+    const count = el("span", "pomo-count", String(task.pomo_count));
+    count.setAttribute("aria-label", `已完成 ${task.pomo_count} 个番茄`);
+    const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    icon.classList.add("pomo-icon");
+    icon.setAttribute("viewBox", "0 0 24 24");
+    icon.setAttribute("fill", "currentColor");
+    icon.setAttribute("aria-hidden", "true");
+    icon.setAttribute("focusable", "false");
+    const silhouette = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    silhouette.setAttribute("d", "M12 7C8 4 3 7 3 13c0 5 4 9 9 9s9-4 9-9c0-6-5-9-9-6Zm0-1C9 6 7 5 6 3c2 0 4 0 5 1V1h2v3c1-1 3-1 5-1-1 2-3 3-6 3Z");
+    icon.append(silhouette);
+    const tm = el("span", "pomo-time", formatMmSs(timerDisplaySecs(task, Date.now())));
+    tm.dataset.pomoLine = String(task.row_idx);
+    pomo.append(count, icon, tm);
+    line.append(pomo);
   }
   body.append(line);
 
@@ -195,7 +199,7 @@ function renderTask(task: TaskView, showSource: boolean): HTMLElement {
   if (meta.childElementCount > 0) body.append(meta);
   item.append(body);
 
-  // 行尾完成勾选框（常显）：勾=完成冻结、取消=恢复为暂停，累计冻结不清零，点状态钮续计。
+  // 行尾完成勾选框（常显）：取消完成回到闲置，保留番茄数。
   const cbx = el("button", "cbx");
   const mark = el("span", "cbx-mark", "✓");
   mark.setAttribute("aria-hidden", "true");
@@ -203,8 +207,8 @@ function renderTask(task: TaskView, showSource: boolean): HTMLElement {
   cbx.dataset.action = "check";
   cbx.setAttribute("role", "checkbox");
   cbx.setAttribute("aria-checked", String(task.checked));
-  cbx.setAttribute("aria-label", task.checked ? "取消完成并恢复为暂停" : "完成任务");
-  cbx.title = task.checked ? "取消勾选：恢复为暂停，累计计时冻结不清零；点状态钮继续计时" : "勾选完成（计时冻结）";
+  cbx.setAttribute("aria-label", task.checked ? "取消完成并恢复为闲置" : "完成任务");
+  cbx.title = task.checked ? "取消勾选：恢复为闲置，保留番茄数；点状态钮开始番茄钟" : "勾选完成（结束当前番茄钟）";
   item.append(cbx);
 
   const del = el("button", "del");

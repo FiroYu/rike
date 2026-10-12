@@ -117,8 +117,7 @@ pub trait GitBackend: Send + Sync {
     fn take_auto_merged(&self) -> Vec<String> { Vec::new() }
 }
 
-// Log only sanitized messages at engine boundaries; backend internals remain unchanged.
-#[cfg(target_os = "android")]
+// Log sanitized errors at sync stage boundaries, including best-effort CLI patches.
 fn log_stage_error<T>(stage: &str, result: &Result<T, SyncError>) {
     if let Err(error) = result {
         let message = crate::sched::sync_error_message(error);
@@ -379,6 +378,162 @@ impl CliGitBackend {
         Ok(())
     }
 
+    /// 与 load_conflict_sides 一样只读常规 blob，保留原始字节与行尾。
+    fn tree_blob(&self, repo_dir: &Path, rev: &str, path: &str) -> Result<Option<Vec<u8>>, SyncError> {
+        let entry = self.git_out(repo_dir, &["ls-tree", rev, "--", &format!(":(literal){path}")])?;
+        let mut meta = entry.split_whitespace();
+        let Some(mode) = meta.next() else { return Ok(None) };
+        if !matches!(mode, "100644" | "100755") {
+            return Err(SyncError::Git(format!("收敛路径 {path} 不是常规文件")));
+        }
+        let oid = meta.nth(1).ok_or_else(|| SyncError::Git("ls-tree 缺少 blob oid".into()))?;
+        run_git_raw(Some(repo_dir), &["cat-file", "blob", oid]).map(Some)
+    }
+
+    /// 补丁的父文件 == 当时的上游文件；它是已计入的共同内容。
+    /// 从 Git 恢复这份虚拟 base，重试/崩溃后也不会再次累计上游的番茄。
+    fn pending_convergence_bases(&self, repo_dir: &Path) -> Result<Vec<(String, Vec<u8>)>, SyncError> {
+        let log = self.git_out(repo_dir, &["log", "--format=%H %s", "--fixed-strings", "--grep=番茄收敛", "@{upstream}..HEAD"])?;
+        let mut bases: Vec<(String, Vec<u8>)> = Vec::new();
+        for line in log.lines() {
+            let Some((commit, subject)) = line.split_once(' ') else { continue };
+            if !subject.starts_with("sticky@") || !subject.contains(": 番茄收敛（") {
+                continue;
+            }
+            let parent = format!("{commit}^");
+            let paths = run_git_raw(Some(repo_dir), &["diff", "--name-only", "-z", &parent, commit])?;
+            for raw_path in paths.split(|&b| b == 0).filter(|p| !p.is_empty()) {
+                let Ok(path) = std::str::from_utf8(raw_path) else { continue };
+                if bases.iter().any(|(p, _)| p == path) {
+                    continue; // 最新的补丁已包含更早的收敛
+                }
+                if let Some(content) = self.tree_blob(repo_dir, &parent, path)? {
+                    bases.push((path.to_string(), content));
+                }
+            }
+        }
+        Ok(bases)
+    }
+
+    /// CLI 专用：字节相同的双端结算也须走增量合并；gix 后端未实现此快路径。
+    fn patch_convergent_files(&self, repo_dir: &Path) -> Result<Vec<String>, SyncError> {
+        if !auto_merge_enabled() {
+            return Ok(vec![]);
+        }
+        let head = self.git_out(repo_dir, &["rev-parse", "--verify", "HEAD"])?;
+        let upstream = self.git_out(repo_dir, &["rev-parse", "--verify", "@{upstream}"])?;
+        let pending = self.pending_convergence_bases(repo_dir)?;
+        {
+            let mut merged = self.auto_merged.lock().unwrap_or_else(|p| p.into_inner());
+            for (path, _) in &pending {
+                if !merged.contains(path) {
+                    merged.push(path.clone()); // 静默 pull 也要补推崩溃前已提交的补丁
+                }
+            }
+        }
+        let base = self.git_out(repo_dir, &["merge-base", &head, &upstream])?;
+        if base == head || base == upstream {
+            return Ok(vec![]);
+        }
+        // 不把调用方已暂存的编辑混入补丁，也不在回退时改动它们。
+        if !self.git_out(repo_dir, &["diff", "--cached", "--name-only"])?.is_empty() {
+            return Ok(vec![]);
+        }
+        let ours_paths = run_git_raw(Some(repo_dir), &["diff", "--name-only", "-z", &base, &head])?;
+        let theirs_paths = run_git_raw(Some(repo_dir), &["diff", "--name-only", "-z", &base, &upstream])?;
+        let mut sides = Vec::new();
+        let mut resolved = Vec::new();
+        for raw_path in ours_paths.split(|&b| b == 0).filter(|p| !p.is_empty()) {
+            if !theirs_paths.split(|&b| b == 0).any(|p| p == raw_path) {
+                continue;
+            }
+            let Ok(path) = std::str::from_utf8(raw_path) else { continue };
+            let candidate = (|| -> Result<_, SyncError> {
+                let credited = pending.iter().find(|(p, _)| p == path);
+                let s = ConflictSides {
+                    path: path.to_string(),
+                    base: match credited {
+                        Some((_, content)) => Some(content.clone()),
+                        None => self.tree_blob(repo_dir, &base, path)?,
+                    },
+                    ours: self.tree_blob(repo_dir, &head, path)?,
+                    theirs: self.tree_blob(repo_dir, &upstream, path)?,
+                };
+                if s.ours.is_none() || s.ours != s.theirs || s.ours == s.base {
+                    return Ok(None);
+                }
+                let Some(files) = crate::merge_resolve::resolve_conflict_set(std::slice::from_ref(&s)) else {
+                    return Ok(None);
+                };
+                let Some(r) = files.into_iter().next() else { return Ok(None) };
+                if Some(&r.content) == s.theirs.as_ref() {
+                    return Ok(None);
+                }
+                let target = repo_dir.join(path);
+                let meta = std::fs::symlink_metadata(&target)
+                    .map_err(|e| SyncError::Git(format!("检查收敛路径 {path} 失败: {e}")))?;
+                if !meta.file_type().is_file() {
+                    return Ok(None);
+                }
+                let current = std::fs::read(&target)
+                    .map_err(|e| SyncError::Git(format!("读取收敛路径 {path} 失败: {e}")))?;
+                if Some(&current) != s.ours.as_ref() {
+                    return Ok(None); // fetch 期间的新编辑不能覆盖
+                }
+                Ok(Some((s, r)))
+            })();
+            log_stage_error("番茄收敛/读取", &candidate);
+            if let Ok(Some((s, r))) = candidate {
+                sides.push(s);
+                resolved.push(r);
+            }
+        }
+        if resolved.is_empty() {
+            return Ok(vec![]);
+        }
+        self.ensure_commit_identity(repo_dir)?;
+        let paths: Vec<&str> = resolved.iter().map(|r| r.path.as_str()).collect();
+        let mut touched = 0;
+        let result = (|| {
+            for r in &resolved {
+                touched += 1; // write 失败也可能已截断文件，仍需恢复这一项
+                std::fs::write(repo_dir.join(&r.path), &r.content)
+                    .map_err(|e| SyncError::Git(format!("写回收敛路径 {} 失败: {e}", r.path)))?;
+                self.git(repo_dir, &["add", "--", &format!(":(literal){}", r.path)])?;
+            }
+            let message = format!("{} 番茄收敛（{}）", commit_prefix(), paths.join("、"));
+            self.git(repo_dir, &["commit", "-m", &message])
+        })();
+        if result.is_err() {
+            // 不留下使原 rebase 变红的补丁工作区/暂存区；仅恢复本次触碰的路径。
+            for s in sides.iter().take(touched) {
+                if let Some(content) = &s.ours {
+                    let restore = std::fs::write(repo_dir.join(&s.path), content)
+                        .map_err(|e| SyncError::Git(format!("回退收敛路径 {} 失败: {e}", s.path)));
+                    log_stage_error("番茄收敛/回退工作区", &restore);
+                }
+            }
+            let pathspecs: Vec<String> = paths.iter().take(touched).map(|p| format!(":(literal){p}")).collect();
+            let mut args = vec!["reset", "--quiet", &head, "--"];
+            args.extend(pathspecs.iter().map(String::as_str));
+            log_stage_error("番茄收敛/回退暂存区", &self.git(repo_dir, &args));
+            result?;
+        }
+        let paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+        let mut merged = self.auto_merged.lock().unwrap_or_else(|p| p.into_inner());
+        for path in &paths {
+            if !merged.contains(path) {
+                merged.push(path.clone());
+            }
+        }
+        Ok(paths)
+    }
+
+    fn try_patch_convergent_files(&self, repo_dir: &Path) {
+        let result = self.patch_convergent_files(repo_dir);
+        log_stage_error("番茄收敛", &result);
+    }
+
     /// rebase 失败善后：冲突类先 abort 回干净态，再尝试语义自动合并；
     /// 成功 → Ok（后续 push 带上合并提交）；不可自动合并 → Conflict。
     fn after_rebase_failure(&self, repo_dir: &Path, err: SyncError, phase: &str) -> Result<(), SyncError> {
@@ -387,7 +542,12 @@ impl CliGitBackend {
         if is_conflict && auto_merge_enabled() {
             return match self.attempt_conflict_merge(repo_dir) {
                 Ok(files) => {
-                    *self.auto_merged.lock().unwrap_or_else(|p| p.into_inner()) = files;
+                    let mut merged = self.auto_merged.lock().unwrap_or_else(|p| p.into_inner());
+                    for file in files {
+                        if !merged.contains(&file) {
+                            merged.push(file);
+                        }
+                    }
                     Ok(())
                 }
                 Err(merge_err) => Err(SyncError::Conflict(format!(
@@ -409,6 +569,9 @@ impl CliGitBackend {
     /// 情况都 `merge --abort` 回到干净态再返回 Err。
     fn attempt_conflict_merge(&self, repo_dir: &Path) -> Result<Vec<String>, SyncError> {
         let pre_merge_head = self.git_out(repo_dir, &["rev-parse", "HEAD"]).unwrap_or_default();
+        let pending = self.pending_convergence_bases(repo_dir);
+        log_stage_error("番茄收敛/恢复共同内容", &pending);
+        let pending = pending.unwrap_or_default();
         let merge_started =
             self.git(repo_dir, &["merge", "--no-commit", "--no-ff", "--no-edit", "@{upstream}"]).is_ok();
         let entries = self.collect_unmerged(repo_dir)?;
@@ -424,7 +587,12 @@ impl CliGitBackend {
             }
             return Ok(vec![]); // Already up to date：无需合并
         }
-        let sides = self.load_conflict_sides(repo_dir, entries)?;
+        let mut sides = self.load_conflict_sides(repo_dir, entries)?;
+        for s in &mut sides {
+            if let Some((_, content)) = pending.iter().find(|(path, _)| path == &s.path) {
+                s.base = Some(content.clone());
+            }
+        }
         let Some(resolved) = crate::merge_resolve::resolve_conflict_set(&sides) else {
             self.git(repo_dir, &["merge", "--abort"]).ok();
             return Err(SyncError::Git(
@@ -534,6 +702,7 @@ impl GitBackend for CliGitBackend {
 
     fn rebase(&self, repo_dir: &Path) -> Result<(), SyncError> {
         self.tracking_ref(repo_dir)?;
+        self.try_patch_convergent_files(repo_dir);
         match self.git(repo_dir, &["rebase", "@{upstream}"]) {
             Ok(_) => Ok(()),
             Err(e) => self.after_rebase_failure(repo_dir, e, "pull"),
@@ -599,6 +768,19 @@ impl GitBackend for CliGitBackend {
 
     fn pull_rebase(&self, repo_dir: &Path) -> Result<(), SyncError> {
         let merge_ref = self.tracking_ref(repo_dir)?;
+        // 融合路径尚未 fetch：先按 pull 的同一 origin/merge 配置刷新上游。
+        // 成功后只 rebase 这份快照，避免二次 fetch 又遇上等字节提交并丢计；
+        // 更新的远端由 push 重试处理。预取失败则保留原 pull 行为。
+        let fetched = self.git(repo_dir, &["fetch", "origin", &merge_ref]);
+        log_stage_error("番茄收敛/fetch", &fetched);
+        if fetched.is_ok() {
+            let tips = self.git(repo_dir, &["rev-parse", "--verify", "HEAD"])
+                .and_then(|_| self.git(repo_dir, &["rev-parse", "--verify", "@{upstream}"]));
+            log_stage_error("番茄收敛/tip", &tips);
+            if tips.is_ok() {
+                return self.rebase(repo_dir);
+            }
+        }
         match self.git(repo_dir, &["pull", "--rebase", "origin", &merge_ref]) {
             Ok(_) => Ok(()),
             Err(e) => self.after_rebase_failure(repo_dir, e, "pull"),
@@ -782,6 +964,308 @@ mod tests {
     #[test]
     fn cli_backend_supports_staged() {
         assert!(CliGitBackend::default().supports_staged_sync());
+    }
+
+    /// 两端从同一 base 独立提交相同字节，b 先推送；不能用同一提交模拟。
+    fn setup_identical_edits(name: &str, files: &[(&str, &str, &str)]) -> (PathBuf, PathBuf, SyncEngine, SyncEngine) {
+        let (a, b, _) = setup_two_party(name);
+        let eng_a = SyncEngine::with_backend(&a, Box::new(CliGitBackend::default()));
+        let eng_b = SyncEngine::with_backend(&b, Box::new(CliGitBackend::default()));
+        for &(path, base, _) in files {
+            write_file(&a, path, base);
+        }
+        eng_a.commit_all("seed convergence base").unwrap();
+        eng_a.push().unwrap();
+        eng_b.pull_staged(&std::sync::Mutex::new(())).unwrap();
+        for &(path, _, content) in files {
+            write_file(&a, path, content);
+            write_file(&b, path, content);
+        }
+        eng_a.commit_all("a independent completion").unwrap();
+        eng_b.commit_all("b independent completion").unwrap();
+        eng_b.push().unwrap();
+        (a, b, eng_a, eng_b)
+    }
+
+    #[test]
+    fn staged_convergence_distinct_segments_adds_both_pomos() {
+        let day = "days/2026-10-09.md";
+        let (a, b, eng_a, eng_b) = setup_identical_edits("convergence-distinct", &[
+            (day, "- [ ] 任务A #pomo 0\n", "- [ ] 任务A #pomo 1\n"),
+        ]);
+        let io = std::sync::Mutex::new(());
+        assert_eq!(eng_a.sync_cycle_staged("sync", &io).unwrap(), SyncStatus::Pushed {
+            rebased: false, auto_merged: vec![day.to_string()],
+        });
+        assert_eq!(std::fs::read(a.join(day)).unwrap(), "- [ ] 任务A #pomo 2\n".as_bytes());
+        eng_b.pull_staged(&io).unwrap();
+        assert_eq!(std::fs::read(a.join(day)).unwrap(), std::fs::read(b.join(day)).unwrap());
+        assert!(run_git(Some(&a), &["status", "--porcelain"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn staged_convergence_same_segment_adds_both_settlements() {
+        let day = "days/2026-10-09.md";
+        let (a, _, eng_a, _) = setup_identical_edits("convergence-same", &[
+            (day, "- [ ] 任务A #pomo 0 #doing #ts 1000\n", "- [ ] 任务A #pomo 1\n"),
+        ]);
+        assert_eq!(eng_a.sync_cycle_staged("sync", &std::sync::Mutex::new(())).unwrap(), SyncStatus::Pushed {
+            rebased: false, auto_merged: vec![day.to_string()],
+        });
+        assert_eq!(std::fs::read_to_string(a.join(day)).unwrap(), "- [ ] 任务A #pomo 2\n");
+    }
+
+    #[test]
+    fn staged_convergence_nonzero_base_uses_additive_count() {
+        let day = "days/2026-10-09.md";
+        let (a, _, eng_a, _) = setup_identical_edits("convergence-nonzero", &[
+            (day, "- [ ] 任务A #pomo 2\n", "- [ ] 任务A #pomo 3\n"),
+        ]);
+        assert_eq!(eng_a.sync_cycle_staged("sync", &std::sync::Mutex::new(())).unwrap(), SyncStatus::Pushed {
+            rebased: false, auto_merged: vec![day.to_string()],
+        });
+        assert_eq!(std::fs::read_to_string(a.join(day)).unwrap(), "- [ ] 任务A #pomo 4\n");
+    }
+
+    #[test]
+    fn staged_convergence_identical_notes_needs_no_patch() {
+        let notes = "notes.txt";
+        let (a, b, eng_a, eng_b) = setup_identical_edits("convergence-notes", &[
+            (notes, "old notes\n", "shared notes\n"),
+        ]);
+        let upstream_count = run_git(Some(&b), &["rev-list", "--count", "HEAD"]).unwrap();
+        assert_eq!(eng_a.sync_cycle_staged("sync", &std::sync::Mutex::new(())).unwrap(), SyncStatus::NothingToPush);
+        assert!(eng_a.backend.take_auto_merged().is_empty());
+        assert_eq!(run_git(Some(&a), &["rev-list", "--count", "HEAD"]).unwrap(), upstream_count);
+        assert_eq!(std::fs::read_to_string(a.join(notes)).unwrap(), "shared notes\n");
+        eng_b.pull_staged(&std::sync::Mutex::new(())).unwrap();
+        assert_eq!(std::fs::read(a.join(notes)).unwrap(), std::fs::read(b.join(notes)).unwrap());
+    }
+
+    #[test]
+    fn staged_convergence_skips_purely_ahead_or_behind() {
+        let (a, b, _) = setup_two_party("convergence-ahead-behind");
+        let eng_a = SyncEngine::with_backend(&a, Box::new(CliGitBackend::default()));
+        let eng_b = SyncEngine::with_backend(&b, Box::new(CliGitBackend::default()));
+        let io = std::sync::Mutex::new(());
+        let day = "days/2026-10-09.md";
+        for count in [0, 1] {
+            write_file(&a, day, &format!("- [ ] 任务A #pomo {count}\n"));
+            eng_a.commit_all("local completion").unwrap();
+            let head = run_git(Some(&a), &["rev-parse", "HEAD"]).unwrap();
+            let commits = run_git(Some(&a), &["rev-list", "--count", "HEAD"]).unwrap();
+            assert_eq!(eng_a.sync_cycle_staged("sync ahead", &io).unwrap(), SyncStatus::Pushed {
+                rebased: false, auto_merged: vec![],
+            });
+            assert_eq!(run_git(Some(&a), &["rev-parse", "HEAD"]).unwrap(), head);
+            assert!(eng_b.pull_staged(&io).unwrap().is_empty());
+            assert_eq!(run_git(Some(&b), &["rev-parse", "HEAD"]).unwrap(), head);
+            assert_eq!(run_git(Some(&b), &["rev-list", "--count", "HEAD"]).unwrap(), commits);
+            assert_eq!(std::fs::read(a.join(day)).unwrap(), std::fs::read(b.join(day)).unwrap());
+        }
+    }
+
+    #[test]
+    fn pull_staged_convergence_commits_multiple_files_once_and_pushes() {
+        let day = "days/2026-10-09 番茄[ab].md";
+        let week = "notebooks/work/weeks/2026-W41.md";
+        let (a, b, eng_a, eng_b) = setup_identical_edits("convergence-multiple", &[
+            (day, "- [ ] 任务A #pomo 0\r\n", "- [ ] 任务A #pomo 1\r\n"),
+            (week, "- [ ] 任务B #pomo 2\n", "- [ ] 任务B #pomo 3\n"),
+        ]);
+        let upstream_count: usize = run_git(Some(&b), &["rev-list", "--count", "HEAD"]).unwrap().parse().unwrap();
+        let io = std::sync::Mutex::new(());
+        assert_eq!(eng_a.pull_staged(&io).unwrap(), vec![day.to_string(), week.to_string()]);
+        assert_eq!(std::fs::read(a.join(day)).unwrap(), "- [ ] 任务A #pomo 2\r\n".as_bytes());
+        assert_eq!(std::fs::read(a.join(week)).unwrap(), "- [ ] 任务B #pomo 4\n".as_bytes());
+        assert_eq!(run_git(Some(&a), &["rev-list", "--count", "HEAD"]).unwrap().parse::<usize>().unwrap(), upstream_count + 1);
+        let message = run_git(Some(&a), &["log", "-1", "--format=%s"]).unwrap();
+        assert!(message.starts_with(&commit_prefix()));
+        assert!(message.contains("番茄收敛") && message.contains(day) && message.contains(week));
+        assert_eq!(eng_a.unpushed_count().unwrap(), 0);
+        eng_b.pull_staged(&io).unwrap();
+        for path in [day, week] {
+            assert_eq!(std::fs::read(a.join(path)).unwrap(), std::fs::read(b.join(path)).unwrap());
+        }
+    }
+
+    #[test]
+    fn pull_rebase_convergence_fetches_current_upstream() {
+        let day = "days/2026-10-09.md";
+        let (a, b, eng_a, eng_b) = setup_identical_edits("convergence-fused", &[
+            (day, "- [ ] 任务A #pomo 0\n", "- [ ] 任务A #pomo 1\n"),
+        ]);
+        // setup 后 a 的跟踪 tip 仍是 base；融合 pull 必须先刷新。
+        assert_eq!(eng_a.sync_cycle("sync").unwrap(), SyncStatus::Pushed {
+            rebased: false, auto_merged: vec![day.to_string()],
+        });
+        assert_eq!(std::fs::read_to_string(a.join(day)).unwrap(), "- [ ] 任务A #pomo 2\n");
+        eng_b.pull().unwrap();
+        assert_eq!(std::fs::read(a.join(day)).unwrap(), std::fs::read(b.join(day)).unwrap());
+    }
+
+    #[test]
+    fn convergence_skips_uncommitted_worktree_changes() {
+        let day = "days/2026-10-09.md";
+        let (a, _, _, _) = setup_identical_edits("convergence-dirty", &[
+            (day, "- [ ] 任务A #pomo 0\n", "- [ ] 任务A #pomo 1\n"),
+        ]);
+        let backend = CliGitBackend::default();
+        backend.fetch(&a).unwrap();
+        let head = run_git(Some(&a), &["rev-parse", "HEAD"]).unwrap();
+        let edited = "- [ ] 正在编辑 #pomo 1\n";
+        write_file(&a, day, edited);
+        assert!(backend.patch_convergent_files(&a).unwrap().is_empty());
+        assert!(backend.take_auto_merged().is_empty());
+        assert_eq!(std::fs::read_to_string(a.join(day)).unwrap(), edited);
+        assert_eq!(run_git(Some(&a), &["rev-parse", "HEAD"]).unwrap(), head);
+        assert!(run_git(Some(&a), &["diff", "--cached", "--name-only"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn convergence_commit_failure_rolls_back_and_keeps_normal_pull() {
+        let day = "days/2026-10-09.md";
+        let (a, b, eng_a, _) = setup_identical_edits("convergence-commit-failure", &[
+            (day, "- [ ] 任务A #pomo 0\n", "- [ ] 任务A #pomo 1\n"),
+        ]);
+        let hook = a.join(".git/hooks/pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(eng_a.sync_cycle_staged("sync", &std::sync::Mutex::new(())).unwrap(), SyncStatus::NothingToPush);
+        assert!(eng_a.backend.take_auto_merged().is_empty());
+        assert!(run_git(Some(&a), &["status", "--porcelain"]).unwrap().is_empty());
+        assert_eq!(std::fs::read(a.join(day)).unwrap(), std::fs::read(b.join(day)).unwrap());
+        assert_eq!(run_git(Some(&a), &["rev-list", "--count", "HEAD"]).unwrap(), run_git(Some(&b), &["rev-list", "--count", "HEAD"]).unwrap());
+    }
+
+    #[test]
+    fn staged_convergence_with_conflict_does_not_double_count_patch() {
+        let day = "days/2026-10-09.md";
+        let conflict = "days/2026-10-10.md";
+        let (a, b, eng_a, eng_b) = setup_identical_edits("convergence-with-conflict", &[
+            (day, "- [ ] 任务A #pomo 0\n", "- [ ] 任务A #pomo 1\n"),
+            (conflict, "- [ ] (P1) 任务B\n", "- [ ] (P1) 任务B\n"),
+        ]);
+        write_file(&a, conflict, "- [x] (P1) 任务B\n");
+        eng_a.commit_all("a checks").unwrap();
+        write_file(&b, conflict, "- [ ] (P0) 任务B\n");
+        eng_b.commit_all("b reprioritizes").unwrap();
+        eng_b.push().unwrap();
+        let io = std::sync::Mutex::new(());
+        let status = eng_a.sync_cycle_staged("sync", &io).unwrap();
+        let SyncStatus::Pushed { auto_merged, .. } = status else { panic!("expected push") };
+        assert_eq!(auto_merged.len(), 2);
+        assert!(auto_merged.contains(&day.to_string()) && auto_merged.contains(&conflict.to_string()));
+        assert_eq!(std::fs::read_to_string(a.join(day)).unwrap(), "- [ ] 任务A #pomo 2\n");
+        assert_eq!(std::fs::read_to_string(a.join(conflict)).unwrap(), "- [x] (P0) 任务B\n");
+        eng_b.pull_staged(&io).unwrap();
+        for path in [day, conflict] {
+            assert_eq!(std::fs::read(a.join(path)).unwrap(), std::fs::read(b.join(path)).unwrap());
+        }
+    }
+
+    #[test]
+    fn pull_staged_convergence_recovers_and_pushes_committed_patch() {
+        let day = "days/2026-10-09.md";
+        let (a, b, _, eng_b) = setup_identical_edits("convergence-recover-push", &[
+            (day, "- [ ] 任务A #pomo 0\n", "- [ ] 任务A #pomo 1\n"),
+        ]);
+        {
+            let interrupted = CliGitBackend::default();
+            interrupted.fetch(&a).unwrap();
+            assert_eq!(interrupted.patch_convergent_files(&a).unwrap(), vec![day.to_string()]);
+            // commit 后、rebase 前退出，内存中的 auto_merged 丢失。
+        }
+        let restarted = SyncEngine::with_backend(&a, Box::new(CliGitBackend::default()));
+        let io = std::sync::Mutex::new(());
+        assert_eq!(restarted.pull_staged(&io).unwrap(), vec![day.to_string()]);
+        assert_eq!(std::fs::read_to_string(a.join(day)).unwrap(), "- [ ] 任务A #pomo 2\n");
+        assert_eq!(restarted.unpushed_count().unwrap(), 0);
+        eng_b.pull_staged(&io).unwrap();
+        assert_eq!(std::fs::read(a.join(day)).unwrap(), std::fs::read(b.join(day)).unwrap());
+    }
+
+    #[test]
+    fn staged_convergence_recovery_preserves_later_completion_and_conflict() {
+        let day = "days/2026-10-09.md";
+        let conflict = "days/2026-10-10.md";
+        let (a, b, eng_a, eng_b) = setup_identical_edits("convergence-recover-conflict", &[
+            (day, "- [ ] 任务A #pomo 0\n", "- [ ] 任务A #pomo 1\n"),
+            (conflict, "- [ ] (P1) 任务B\n", "- [ ] (P1) 任务B\n"),
+        ]);
+        {
+            let interrupted = CliGitBackend::default();
+            interrupted.fetch(&a).unwrap();
+            assert_eq!(interrupted.patch_convergent_files(&a).unwrap(), vec![day.to_string()]);
+        }
+        write_file(&a, day, "- [ ] 任务A #pomo 3\n"); // 重启前又完成一个真实番茄
+        write_file(&a, conflict, "- [x] (P1) 任务B\n");
+        eng_a.commit_all("a completes again and checks").unwrap();
+        write_file(&b, conflict, "- [ ] (P0) 任务B\n");
+        eng_b.commit_all("b reprioritizes").unwrap();
+        eng_b.push().unwrap();
+        let restarted = SyncEngine::with_backend(&a, Box::new(CliGitBackend::default()));
+        let io = std::sync::Mutex::new(());
+        let SyncStatus::Pushed { auto_merged, .. } = restarted.sync_cycle_staged("sync", &io).unwrap() else {
+            panic!("expected push");
+        };
+        assert_eq!(auto_merged.len(), 2);
+        assert!(auto_merged.contains(&day.to_string()) && auto_merged.contains(&conflict.to_string()));
+        assert_eq!(std::fs::read_to_string(a.join(day)).unwrap(), "- [ ] 任务A #pomo 3\n");
+        assert_eq!(std::fs::read_to_string(a.join(conflict)).unwrap(), "- [x] (P0) 任务B\n");
+        eng_b.pull_staged(&io).unwrap();
+        for path in [day, conflict] {
+            assert_eq!(std::fs::read(a.join(path)).unwrap(), std::fs::read(b.join(path)).unwrap());
+        }
+    }
+
+    #[test]
+    fn staged_convergence_recovery_counts_new_upstream_completion_once() {
+        let day = "days/2026-10-09.md";
+        let (a, b, _, eng_b) = setup_identical_edits("convergence-recover-upstream", &[
+            (day, "- [ ] 任务A #pomo 0\n", "- [ ] 任务A #pomo 1\n"),
+        ]);
+        {
+            let interrupted = CliGitBackend::default();
+            interrupted.fetch(&a).unwrap();
+            assert_eq!(interrupted.patch_convergent_files(&a).unwrap(), vec![day.to_string()]);
+        }
+        write_file(&b, day, "- [ ] 任务A #pomo 2\n");
+        eng_b.commit_all("b completes again").unwrap();
+        eng_b.push().unwrap();
+        let restarted = SyncEngine::with_backend(&a, Box::new(CliGitBackend::default()));
+        let io = std::sync::Mutex::new(());
+        assert_eq!(restarted.pull_staged(&io).unwrap(), vec![day.to_string()]);
+        assert_eq!(std::fs::read_to_string(a.join(day)).unwrap(), "- [ ] 任务A #pomo 3\n");
+        assert_eq!(restarted.unpushed_count().unwrap(), 0);
+        eng_b.pull_staged(&io).unwrap();
+        assert_eq!(std::fs::read(a.join(day)).unwrap(), std::fs::read(b.join(day)).unwrap());
+    }
+
+    #[test]
+    fn convergence_push_retry_counts_completion_after_fetch_once() {
+        let day = "days/2026-10-09.md";
+        let (a, b, _, eng_b) = setup_identical_edits("convergence-fetch-race", &[
+            (day, "- [ ] 任务A #pomo 0\n", "- [ ] 任务A #pomo 1\n"),
+        ]);
+        let backend = CliGitBackend::default();
+        backend.fetch(&a).unwrap();
+        // 预取后、rebase 前远端又完成一个；必须先基于已取快照结算到 2。
+        write_file(&b, day, "- [ ] 任务A #pomo 2\n");
+        eng_b.commit_all("b completes after fetch").unwrap();
+        eng_b.push().unwrap();
+        backend.rebase(&a).unwrap();
+        assert_eq!(std::fs::read_to_string(a.join(day)).unwrap(), "- [ ] 任务A #pomo 2\n");
+        assert!(backend.push_with_retry(&a).unwrap());
+        assert_eq!(backend.take_auto_merged(), vec![day.to_string()]);
+        assert_eq!(std::fs::read_to_string(a.join(day)).unwrap(), "- [ ] 任务A #pomo 3\n");
+        assert_eq!(backend.unpushed_count(&a).unwrap(), 0);
+        eng_b.pull_staged(&std::sync::Mutex::new(())).unwrap();
+        assert_eq!(std::fs::read(a.join(day)).unwrap(), std::fs::read(b.join(day)).unwrap());
     }
 
     #[test]

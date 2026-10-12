@@ -651,8 +651,7 @@ impl StickyStore {
             .unwrap_or(0)
     }
 
-    /// v0.8 状态机入口：target ∈ doing|paused|done（todo 由 parse_status 拒绝）。
-    /// 结算/续计/复活的字节手术全部在 parser::set_status_at 内完成。
+    /// 番茄状态入口：paused 仅允许取消完成，运行中不可暂停。
     pub fn set_task_status(
         &self, notebook: &str,
         kind: &FileKind,
@@ -660,15 +659,44 @@ impl StickyStore {
         target: crate::parser::TaskStatus,
         base_version: u64,
     ) -> Result<EditResult, CmdError> {
-        let now = Self::unix_now();
         let bv = self.edit(notebook, kind, base_version, move |f| {
+            let now = Self::unix_now();
+            if target == crate::parser::TaskStatus::Paused
+                && f.status_at(line_idx)? != crate::parser::TaskStatus::Done {
+                return Err("仅完成任务可恢复为闲置，番茄钟不可暂停".into());
+            }
             f.set_status_at(line_idx, target, now)
         })?;
         Ok(EditResult { base_version: bv })
     }
 
-    /// 旧勾选命令的 v0.8.1 适配：勾 = set_status(done)（Doing 结算冻结）；
-    /// 取消勾选且当前 Done = set_status(paused)，保留冻结计时；其余（非 Done 取消勾选）无操作。
+    /// 段已终止、不存在或尚未到期时返回当前版本；只有实际结算才校验写入版本。
+    pub fn settle_pomo(
+        &self, notebook: &str, kind: &FileKind, line_idx: usize,
+        base_version: u64, expected_ts: u64,
+    ) -> Result<EditResult, CmdError> {
+        self.ensure_repo_ready()?;
+        let _g = self.io_lock();
+        let now = Self::unix_now();
+        let Some(text) = self.read_file(notebook, kind)? else {
+            return Ok(EditResult { base_version: 0 });
+        };
+        let current = hash_text(&text);
+        let mut file = TodoFile::parse(&text);
+        if !file.settle_pomo_at(line_idx, expected_ts, now) {
+            return Ok(EditResult { base_version: current });
+        }
+        if current != base_version {
+            return Err(CmdError::stale());
+        }
+        let out = file.serialize();
+        let path = kind.abs_path(&notebook::root(self.engine.repo_dir(), notebook)?);
+        notebook::atomic_write(&path, &out)?;
+        self.pending_edits.fetch_add(1, Ordering::Relaxed);
+        Ok(EditResult { base_version: hash_text(&out) })
+    }
+
+    /// 勾选完成时结算到期段；取消完成恢复闲置，保留番茄数。
     pub fn set_checked(
         &self, notebook: &str,
         kind: &FileKind,
@@ -676,8 +704,8 @@ impl StickyStore {
         checked: bool,
         base_version: u64,
     ) -> Result<EditResult, CmdError> {
-        let now = Self::unix_now();
         let bv = self.edit(notebook, kind, base_version, move |f| {
+            let now = Self::unix_now();
             let cur = f.status_at(line_idx)?;
             match (checked, cur) {
                 (true, _) => f.set_status_at(line_idx, crate::parser::TaskStatus::Done, now),
@@ -713,8 +741,7 @@ impl StickyStore {
     }
 
     /// 状态标签。`#overdue` 只读（PRD D4）——不可设置、不可清除。
-    /// v0.8 适配：doing 的开/关映射到状态机 Doing/Paused（含遗留无 ts 补启），
-    /// 其余情况无操作（保持旧幂等语义，不再直接增删标签）。
+    /// 旧 doing 开关仅可开始；关闭运行任务拒绝，其余关闭请求幂等无操作。
     pub fn set_flag(
         &self, notebook: &str,
         kind: &FileKind,
@@ -726,13 +753,13 @@ impl StickyStore {
         if flag == Flag::Overdue {
             return Err(CmdError::bad_request("#overdue 只读：由外部例行任务维护"));
         }
-        let now = Self::unix_now();
         let bv = self.edit(notebook, kind, base_version, move |f| {
+            let now = Self::unix_now();
             let cur = f.status_at(line_idx)?;
             match (on, cur) {
                 (true, _) => f.set_status_at(line_idx, crate::parser::TaskStatus::Doing, now),
                 (false, crate::parser::TaskStatus::Doing) => {
-                    f.set_status_at(line_idx, crate::parser::TaskStatus::Paused, now)
+                    Err("番茄钟不可暂停".into())
                 }
                 (false, _) => Ok(()),
             }
@@ -768,7 +795,8 @@ impl StickyStore {
     ) -> Result<DeleteResult, CmdError> {
         let mut removed = Vec::new();
         let bv = self.edit(notebook, kind, base_version, |f| {
-            removed = f.delete_task(line_idx)?;
+            let now = Self::unix_now();
+            removed = f.delete_task_at(line_idx, now)?;
             Ok(())
         })?;
         Ok(DeleteResult { base_version: bv, line_idx, removed })

@@ -12,6 +12,11 @@
   --accent: #c2331f;
   --link: #1d4ed8;
   --ok: #3f7d4e;
+  /* 番茄三件套：莫兰迪陶土系（低饱和暖红，与素纸/便签纸色同族；
+     有意区别于 --accent 强调红——那专属受阻/逾期/P0）。 */
+  --pomo-rose: #ad7568;       /* 图标：灰陶玫瑰 */
+  --pomo-rose-mute: #8a655d;  /* 累计数：暖灰陶 */
+  --pomo-rose-deep: #7c4a42;  /* 运行态计时：深陶 */
   --wash: rgba(22, 24, 26, 0.06);
   --paper-pattern: none;
   /* 状态钮与完成框均以符号表意，完成前后不换底色或边框色。
@@ -305,9 +310,7 @@ button:focus-visible, input:focus-visible, summary:focus-visible, [tabindex]:foc
 .bar.p2 { color: var(--ink-2); }
 .bar.pnone { opacity: 0.55; }
 
-/* 左侧状态钮（v0.8 四态合一）：待开始 ○ / 进行中 ▶ / 暂停 ‖ / 完成 ✓（禁点）。
-   单击循环只在进行中⇄暂停（待开始首点→进行中）；完成走行尾勾选框。
-   v0.8.1 方框恒为透明底+墨色边框，状态只由框内符号形状区分（不再换底色）。 */
+/* 左侧开始钮：闲置 ○；运行中 ▶ 与完成 ○ 均真禁用，保持占位。 */
 .st {
   flex: none;
   width: 15px;
@@ -334,12 +337,14 @@ button:focus-visible, input:focus-visible, summary:focus-visible, [tabindex]:foc
   color: var(--ink);
   transition: background-color 0.12s ease;
 }
-.st:not([aria-disabled="true"]):hover .st-mark { background: var(--wash); }
-.st[aria-disabled="true"] { cursor: default; }
+.st:enabled:hover .st-mark { background: var(--wash); }
+.st:disabled { cursor: default; }
+.item.doing .st:disabled { opacity: 0.45; }
 .item.todo .st-mark,
+.item.paused .st-mark,
 .item.done .st-mark { color: var(--ink-3); opacity: 0.5; font-size: 10px; }
 
-/* 行尾完成勾选框（常显）：勾=完成冻结、取消=复活续计；完成不进单击循环。 */
+/* 行尾完成勾选框（常显）：取消完成回到闲置，点开始钮开启新段。 */
 .cbx {
   flex: none;
   width: 20px;
@@ -370,7 +375,7 @@ button:focus-visible, input:focus-visible, summary:focus-visible, [tabindex]:foc
 .item.done .cbx-mark { color: var(--ink); }
 
 .body { flex: 1; min-width: 0; }
-/* 标题行：正文占位 + 计时器右对齐黑色正字 */
+/* 标题行：正文占位 + 番茄三件套右对齐 */
 .title-line { display: flex; align-items: baseline; gap: 8px; }
 .title-line .txt { flex: 1; min-width: 0; }
 .txt {
@@ -380,17 +385,27 @@ button:focus-visible, input:focus-visible, summary:focus-visible, [tabindex]:foc
   cursor: text;
 }
 .item.done .txt { color: var(--ink-3); text-decoration: line-through; }
-.timer {
+.pomo {
   flex: none;
   margin-left: auto;
-  color: var(--ink);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3em;
+  color: var(--pomo-rose-mute);
   font-family: var(--mono);
   font-size: calc(10.5px * var(--fs-scale));
+  font-variant-numeric: tabular-nums;
   letter-spacing: 0.03em;
   white-space: nowrap;
   cursor: default;
 }
-.item.done .timer { color: var(--ink-3); }
+.pomo-count { min-width: 1.5em; text-align: right; }
+.pomo-icon { width: 1em; height: 1em; flex: none; color: var(--pomo-rose); }
+.pomo-time { min-width: 5ch; text-align: right; }
+/* 运行态计时用最深一档陶土，静止时三件套保持同一莫兰迪色族。 */
+.item.doing .pomo-time { color: var(--pomo-rose-deep); }
+.item.done .pomo { color: var(--ink-3); }
+.item.done .pomo-icon { color: var(--ink-3); }
 .txt-input {
   width: 100%;
   border: none;
@@ -579,6 +594,8 @@ button:focus-visible, input:focus-visible, summary:focus-visible, [tabindex]:foc
 ::-webkit-scrollbar { width: 8px; }
 ::-webkit-scrollbar-thumb { background: rgba(22, 24, 26, 0.25); }
 ::-webkit-scrollbar-track { background: transparent; }
+html { scrollbar-width: none; }
+html::-webkit-scrollbar { width: 0; height: 0; }
 
 /* 外观选择在正常文档流中展开，随窗口量高，无浮层遮挡清单。 */
 .footer-area { position: relative; }
@@ -590,6 +607,7 @@ button:focus-visible, input:focus-visible, summary:focus-visible, [tabindex]:foc
 .theme-panel { border-top: 1px solid var(--hairline); }
 .theme-heading { padding: 9px 12px 7px; color: var(--ink-2); font-size: 11px; }
 #theme-name { float: right; font-weight: 600; }
+.version-row { padding: 0 12px 8px; color: var(--ink-2); font-size: 10px; }
 .theme-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; padding: 2px 12px 6px; }
 /* v0.8 字号五档（12–16px）：A− / 当前档 / A⁺，边界档禁用对应按钮。 */
 .fontsize-row { display: flex; align-items: center; gap: 8px; padding: 4px 12px 8px; }
@@ -636,7 +654,7 @@ html[data-theme="glass"], html[data-theme="glass"] body { background: transparen
    pull-hint/load-retry）——Windows 触屏设备同样投放玻璃主题。
    :is() 吸收 #add-slot .add-open 的 ID 特异性，整条 (1,2,1) 压过全部基础规则。 */
 html[data-theme="glass"] :is(.undo, .ctx, #date-pick, #notebook-panel, #notes-panel,
-  .theme-panel, .add-fab, #add-slot .add-open, .pull-hint, .load-retry, .board-editor, #board-undo) {
+  .theme-panel, .add-fab, #add-slot .add-open, .pull-hint, .load-retry, #board-undo) {
   background: rgba(236, 240, 246, 0.40);
   backdrop-filter: blur(10px) saturate(140%);
 }
@@ -718,14 +736,14 @@ html[data-theme="glass"] :is(#sync-settings-form input, .notes-input:focus, .add
   .add, .add-open { border-top: 1px solid var(--hairline); }
   /* v0.8 桌面删除入口改右键菜单「删除这条任务」，行内 ✕ 只保留给触摸端。 */
   .del { display: none; }
-  #board { display: flex; position: relative; flex: 1; min-height: 0; flex-direction: column; margin: 8px 10px 4px; border: 1px solid var(--hairline); border-radius: 8px; overflow: hidden; background: radial-gradient(rgba(22,24,26,.09) .7px, transparent .7px) 12px 12px / 12px 12px, #f7f6f3; }
+  #board { display: flex; position: relative; flex: 1; min-height: 0; flex-direction: column; margin: 8px 10px 4px; border: 1px solid transparent; border-radius: 8px; overflow: hidden; background: radial-gradient(rgba(22,24,26,.09) .7px, transparent .7px) 12px 12px / 12px 12px, #f7f6f3; }
   .board-head { display: flex; align-items: center; gap: 7px; min-height: 30px; padding: 0 10px; border-bottom: 1px solid var(--hairline); background: var(--panel); }
   .board-title { font: 600 12px var(--sans); color: var(--ink); }
   .board-count, .board-status { font: 10px var(--mono); color: var(--ink-3); }
   .board-status { flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
   #board-add { border: 0; background: transparent; color: var(--ink); font: 11px var(--sans); cursor: pointer; }
   #board-add:hover, .board-empty button:hover { color: var(--ink); text-decoration: underline; }
-  #board-grid { flex: 1; min-height: 0; overflow-y: auto; display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 12px 8px; align-content: start; padding: 8px 10px 10px; scrollbar-width: thin; scrollbar-color: var(--hairline) transparent; }
+  #board-grid { flex: 1; min-height: 0; overflow-y: auto; display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 12px 8px; align-content: start; padding: 8px 10px 10px; scrollbar-width: none; }
   .board-sticker { position: relative; aspect-ratio: 1 / 1; min-width: 0; padding: 15px 9px; border-radius: 12px; background: var(--paper,#f0e9d2); box-shadow: 0 1px 2px rgba(22,24,26,.16), 0 0 0 .5px rgba(22,24,26,.06); transform: rotate(var(--rot)); transition: transform .15s, box-shadow .15s; cursor: pointer; overflow: hidden; }
   .board-sticker:hover { transform: rotate(var(--rot)) translateY(-5px) scale(1.05); box-shadow: 0 7px 14px rgba(22,24,26,.24); z-index: 3; }
   .board-sticker:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
@@ -750,7 +768,10 @@ html[data-theme="glass"] :is(#sync-settings-form input, .notes-input:focus, .add
   #board-title { flex: 0 1 auto; width: 68%; min-width: 40%; padding: 4px 0; border: 0; background: transparent; color: var(--ink); font: 700 15px/1.4 var(--hand); }
   #board-title:focus { outline: none; }
   #board-title::placeholder { color: var(--ink-3); font-style: italic; font-weight: 400; }
-  #board-area { display: block; width: 100%; flex: 1; min-height: 0; max-height: none; height: auto; resize: none; overflow-y: auto; padding: 12px 21px 20px; border: 0; background: var(--ed-paper,#f0e9d2); color: var(--ink); font: 13px/1.6 var(--sans); }
+  #board-area { display: block; width: 100%; flex: 1; min-height: 0; max-height: none; height: auto; resize: none; overflow-y: auto; scrollbar-width: none; padding: 12px 21px 20px; border: 0; background: var(--ed-paper,#f0e9d2); color: var(--ink); font: 13px/1.6 var(--sans); }
+  #board-area:focus-visible { outline: none; }
+  .board-shortcuts { flex: 0 0 auto; padding: 7px 14px 9px; color: var(--ink-3); font: 10px/1.4 var(--sans); text-align: center; white-space: nowrap; }
+  .board-shortcuts span { padding: 0 4px; }
   #board-zoom { position: static; margin-left: auto; flex: 0 0 auto; width: 22px; height: 22px; padding: 0; border: 1.5px solid var(--ink-3); border-radius: 2px; background: transparent; display: grid; place-items: center; color: var(--ink-3); font: 16px/1 var(--sans); cursor: pointer; }
   #board-zoom:hover { background: var(--wash); color: var(--ink); }
   .board-zoom-resize { display: none; position: absolute; right: 0; bottom: 0; width: 16px; height: 16px; color: var(--ink-3); cursor: nwse-resize; touch-action: none; }

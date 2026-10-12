@@ -3,7 +3,7 @@
 export type Priority = "P0" | "P1" | "P2" | "P3";
 export type Category = "Work" | "Personal" | "Uncategorized";
 export type ViewKind = "day" | "week";
-/** serde(rename_all = "lowercase") 的 TaskStatus：待开始一次性初始态，永不回归 */
+/** serde(rename_all = "lowercase")；后端 paused 表示开始过的闲置态。 */
 export type TaskStatus = "todo" | "doing" | "paused" | "done";
 
 export interface NoteDayDto { date: string; weekday: string; content: string; base_version: string }
@@ -28,14 +28,18 @@ export interface TaskView {
   doing: boolean;
   overdue: boolean;
   blocked_reason: string | null;
-  /** v0.8 四态派生（checked > #paused > #doing > 仅 t/ts > todo） */
+  /** 后端派生状态；todo / paused 均可开始一段番茄钟。 */
   status: TaskStatus;
-  /** 已结算累计秒（含 Doing 态的进行中增量由前端 ticker 现算） */
+  /** legacy #t 累计秒；番茄钟显示仅使用当前段起点。 */
   timer_secs: number;
   /** Doing 态的起点 Unix 秒；非 Doing 或无 #ts 时为 null */
   timer_started_at: number | null;
   /** 行内存在非法 #t token（值取最后合法值，标签由下次状态手术清理） */
   timer_invalid: boolean;
+  /** 已完成番茄数（含 legacy #t 折算）。 */
+  pomo_count: number;
+  /** 已落 #pomo 或 legacy #t，含零值与非法值。 */
+  pomo_started: boolean;
   sub_lines: string[];
   section: string;
   subsection: string | null;
@@ -80,6 +84,13 @@ export type SyncState =
   | { kind: "conflict"; message: string }
   | { kind: "merged"; files: string[] }
   | { kind: "error"; message: string };
+
+export interface UpdateStatus {
+  current: string;
+  latest: string | null;
+  state: "idle" | "checking" | "downloading" | "ready" | "updated" | "error" | "no_token";
+  message: string | null;
+}
 
 export class ApiError extends Error {
   constructor(
@@ -158,11 +169,19 @@ export const api = {
     notebookId: string,
     kind: ViewKind,
     lineIdx: number,
-    /** "todo" 后端拒绝（待开始不可回归）；done=完成冻结、doing=复活续计 */
+    /** doing=开始、done=完成；paused 仅用于取消完成回到闲置。 */
     target: "doing" | "paused" | "done",
     baseVersion: string,
     date?: string | null,
   ) => call<{ base_version: string }>("set_status", { notebookId, kind, lineIdx, target, baseVersion, date }),
+  settlePomo: (
+    notebookId: string,
+    kind: ViewKind,
+    lineIdx: number,
+    baseVersion: string,
+    expectedTs: number,
+    date?: string | null,
+  ) => call<{ base_version: string }>("settle_pomo", { notebookId, kind, lineIdx, baseVersion, expectedTs, date }),
   deleteTask: (
     notebookId: string,
     kind: ViewKind,
@@ -200,9 +219,11 @@ export const api = {
       subLines,
     }),
   syncNow: () => call<null>("sync_now"),
-  getSyncConfig: () => call<{ repo_url: string; pat_set: boolean }>("get_sync_config"),
-  setSyncConfig: (repoUrl?: string, pat?: string) =>
-    call<void>("set_sync_config", { repoUrl, pat }),
+  getSyncConfig: () => call<{ repo_url: string; pat_set: boolean; update_pat_set: boolean }>("get_sync_config"),
+  setSyncConfig: (repoUrl?: string, pat?: string, updatePat?: string) =>
+    call<void>("set_sync_config", { repoUrl, pat, updatePat }),
+  updateStatus: () => call<UpdateStatus>("update_status"),
+  updateCheckNow: () => call<void>("update_check_now"),
   syncStatus: () => call<SyncState>("sync_status"),
   machineTag: () => call<string>("machine_tag"),
   shellSink: () => call<null>("shell_sink"),

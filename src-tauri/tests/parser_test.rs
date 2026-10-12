@@ -365,7 +365,7 @@ fn validate_user_text_rules() {
 
 // ---------- v0.8：四态状态机 / 任务计时器 / 多行子行 ----------
 
-use app_lib::parser::{TaskStatus, TIMER_CAP_SECS};
+use app_lib::parser::{POMO_CAP, POMO_SECS, TaskStatus, TIMER_CAP_SECS};
 
 fn one_task(text: &str) -> (TodoFile, usize) {
     let tf = TodoFile::parse(text);
@@ -380,19 +380,19 @@ fn task_status(text: &str) -> (TaskStatus, u64, Option<u64>, bool) {
     (t.status, t.timer_secs, t.timer_started_at, t.timer_invalid)
 }
 
-/// 四态派生：checked > paused > doing > 仅计时标签(非规范 Paused) > Todo。
+/// 状态派生：checked > paused > doing(须合法 #ts) > 仅计时标签(闲置) > Todo。
 #[test]
 fn v08_status_derivation() {
     assert_eq!(task_status("- [ ] (P1) 纯待开始\n").0, TaskStatus::Todo);
     assert_eq!(task_status("- [ ] (P1) 进行中 #doing #t 0 #ts 100\n").0, TaskStatus::Doing);
     assert_eq!(task_status("- [ ] (P1) 暂停 #paused #t 30\n").0, TaskStatus::Paused);
     assert_eq!(task_status("- [x] (P1) 完成 #t 30\n").0, TaskStatus::Done);
-    // 仅 #t（非规范落盘）→ Paused；doing+paused 并存 → Paused 优先
+    // 仅 #t（非规范落盘）→ 闲置；doing+paused 并存 → paused 优先
     assert_eq!(task_status("- [ ] (P1) 只有累计 #t 30\n").0, TaskStatus::Paused);
     assert_eq!(task_status("- [ ] (P1) 冲突 #doing #paused #t 30\n").0, TaskStatus::Paused);
-    // 旧协议 #doing 无 #t：Doing、累计 0
+    // 旧协议 #doing 无 #t/#ts：不算运行段，按「已开始未运行」闲置派生
     let (st, secs, _, _) = task_status("- [ ] (P1) 旧协议 #doing\n");
-    assert_eq!((st, secs), (TaskStatus::Doing, 0));
+    assert_eq!((st, secs), (TaskStatus::Paused, 0));
 }
 
 /// 计时派生：多 #t 后者胜、封顶 CAP、非法值置 invalid 且按 0 参与。
@@ -425,8 +425,8 @@ fn v08_tag_word_boundary() {
     assert_eq!(task_status("- [ ] a #pausedx\n").0, TaskStatus::Todo);
     // #t5：t 无边界，不是标签
     assert_eq!(task_status("- [ ] a #t5\n").0, TaskStatus::Todo);
-    // 旧词前缀语义保留：#doingx → doing
-    assert_eq!(task_status("- [ ] a #doingx\n").0, TaskStatus::Doing);
+    // 旧词前缀语义保留：#doingx → 识别为 doing 标签；无合法 #ts → 闲置
+    assert_eq!(task_status("- [ ] a #doingx\n").0, TaskStatus::Paused);
     // #ts 与 #t 并存：ts 不被当成 t 的值
     let (_, secs, ts, _) = task_status("- [ ] a #t 5 #ts 100\n");
     assert_eq!((secs, ts), (5, Some(100)));
@@ -438,7 +438,7 @@ fn v08_blocked_empty_reason_adjacent_tag() {
     let tf = TodoFile::parse("- [ ] a #blocked #doing\n- [ ] b #blocked #t 5\n- [ ] c #blocked #paused #t 3\n");
     assert_eq!(tf.tasks.len(), 3);
     assert_eq!(tf.tasks[0].blocked_reason, None);
-    assert_eq!(tf.tasks[0].status, TaskStatus::Doing);
+    assert_eq!(tf.tasks[0].status, TaskStatus::Paused);
     assert_eq!(tf.tasks[1].blocked_reason, None);
     assert_eq!(tf.tasks[1].timer_secs, 5);
     assert_eq!(tf.tasks[2].blocked_reason, None);
@@ -448,40 +448,44 @@ fn v08_blocked_empty_reason_adjacent_tag() {
     assert_eq!(tf.serialize(), text);
 }
 
-/// 状态转移矩阵（固定时间样例，GPT-6 方案 §4.1）：
-/// 100/110 → 10；200/205 → 15；300/307 → 22（复活续计不清零）。
+/// 状态转移（番茄钟）：首开始初始化 #pomo 0；未到期停段作废不计数；
+/// 到期完成先结算 +1；复活保留计数为闲置；再开始开新段。
 #[test]
 fn v08_set_status_transition_times() {
     let (mut tf, li) = one_task("## 日任务\n\n- [ ] (P1) 写周报\n");
 
-    // 待开始 → 进行中 @100：首离待开始即写 #t 0
+    // 待开始 → 进行中 @100：首开始即初始化 #pomo 0 与段起点
     tf.set_status_at(li, TaskStatus::Doing, 100).unwrap();
-    assert_eq!(tf.lines[li], "- [ ] (P1) 写周报 #t 0 #doing #ts 100");
+    assert_eq!(tf.lines[li], "- [ ] (P1) 写周报 #pomo 0 #doing #ts 100");
 
-    // 进行中 → 暂停 @110：结算 0 + 10
+    // 进行中 → 闲置 @110（elapsed 10 < 1500）：段作废，计数不变，不写 #paused
     tf.set_status_at(li, TaskStatus::Paused, 110).unwrap();
-    assert_eq!(tf.lines[li], "- [ ] (P1) 写周报 #t 10 #paused");
+    assert_eq!(tf.lines[li], "- [ ] (P1) 写周报 #pomo 0");
 
-    // 暂停 → 进行中 @200：保留 t，重设 ts
+    // 闲置 → 进行中 @200：重开新段
     tf.set_status_at(li, TaskStatus::Doing, 200).unwrap();
-    assert_eq!(tf.lines[li], "- [ ] (P1) 写周报 #t 10 #doing #ts 200");
+    assert_eq!(tf.lines[li], "- [ ] (P1) 写周报 #pomo 0 #doing #ts 200");
 
-    // 进行中 → 完成 @205：结算 10 + 5，删 doing/ts
-    tf.set_status_at(li, TaskStatus::Done, 205).unwrap();
-    assert_eq!(tf.lines[li], "- [x] (P1) 写周报 #t 15");
+    // 进行中 → 完成 @1700（elapsed 1500）：先结算 +1 再完成
+    tf.set_status_at(li, TaskStatus::Done, 1700).unwrap();
+    assert_eq!(tf.lines[li], "- [x] (P1) 写周报 #pomo 1");
 
-    // 完成 → 进行中 @300：复活，t 冻结值续计
-    tf.set_status_at(li, TaskStatus::Doing, 300).unwrap();
-    assert_eq!(tf.lines[li], "- [ ] (P1) 写周报 #t 15 #doing #ts 300");
+    // 完成 → 复活 @1705：闲置，计数保留
+    tf.set_status_at(li, TaskStatus::Paused, 1705).unwrap();
+    assert_eq!(tf.lines[li], "- [ ] (P1) 写周报 #pomo 1");
 
-    // 进行中 → 暂停 @307：15 + 7
-    tf.set_status_at(li, TaskStatus::Paused, 307).unwrap();
-    assert_eq!(tf.lines[li], "- [ ] (P1) 写周报 #t 22 #paused");
+    // 闲置 → 进行中 @1800：下一段
+    tf.set_status_at(li, TaskStatus::Doing, 1800).unwrap();
+    assert_eq!(tf.lines[li], "- [ ] (P1) 写周报 #pomo 1 #doing #ts 1800");
+
+    // 进行中 → 闲置 @1805（elapsed 5）：段作废
+    tf.set_status_at(li, TaskStatus::Paused, 1805).unwrap();
+    assert_eq!(tf.lines[li], "- [ ] (P1) 写周报 #pomo 1");
 
     // 派生核对
     assert_eq!(tf.status_at(li).unwrap(), TaskStatus::Paused);
     let t = &tf.tasks[0];
-    assert_eq!((t.status, t.timer_secs), (TaskStatus::Paused, 22));
+    assert_eq!((t.status, t.pomo_count, t.pomo_started), (TaskStatus::Paused, 1, true));
 }
 
 /// 拒绝项：todo 目标、非任务行。（Done→Paused 于 v0.8.1 放开为复活路径，
@@ -493,77 +497,97 @@ fn v08_set_status_rejections() {
     assert!(tf.set_status_at(0, TaskStatus::Doing, 100).is_err(), "标题行不是任务");
 }
 
-/// 同态幂等：字节零变化；唯一例外 Doing 无 ts 时补启。
+/// 同态幂等：规范形态字节零变化；legacy 残留（#t/#paused/重复 token）
+/// 即使同态也走迁移手术收敛为规范形态。
 #[test]
 fn v08_set_status_idempotent() {
+    // 规范闲置态：零字节改动
+    let (mut tf, li) = one_task("## 日任务\n\n- [ ] (P1) a #pomo 10\n");
+    tf.set_status_at(li, TaskStatus::Paused, 999).unwrap();
+    assert_eq!(tf.lines[li], "- [ ] (P1) a #pomo 10", "Paused→Paused 零改动");
+
+    let (mut tf, li) = one_task("## 日任务\n\n- [x] (P1) a #pomo 10\n");
+    tf.set_status_at(li, TaskStatus::Done, 999).unwrap();
+    assert_eq!(tf.lines[li], "- [x] (P1) a #pomo 10", "Done→Done 零改动");
+
+    // legacy #paused 同态：迁移为 #pomo 原位锚点（10s 折算 0）
     let (mut tf, li) = one_task("## 日任务\n\n- [ ] (P1) a #t 10 #paused\n");
     tf.set_status_at(li, TaskStatus::Paused, 999).unwrap();
-    assert_eq!(tf.lines[li], "- [ ] (P1) a #t 10 #paused", "Paused→Paused 零改动");
+    assert_eq!(tf.lines[li], "- [ ] (P1) a #pomo 0");
 
-    let (mut tf, li) = one_task("## 日任务\n\n- [x] (P1) a #t 10\n");
-    tf.set_status_at(li, TaskStatus::Done, 999).unwrap();
-    assert_eq!(tf.lines[li], "- [x] (P1) a #t 10", "Done→Done 零改动");
-
-    // 遗留无 ts 的 Doing（旧协议）：幂等路径例外，补 ts 不重置 t
+    // 遗留无 ts 的 Doing（旧协议）：迁移 + 补启段
     let (mut tf, li) = one_task("## 日任务\n\n- [ ] (P1) a #doing #t 10\n");
     tf.set_status_at(li, TaskStatus::Doing, 500).unwrap();
-    assert_eq!(tf.lines[li], "- [ ] (P1) a #t 10 #doing #ts 500");
+    assert_eq!(tf.lines[li], "- [ ] (P1) a #pomo 0 #doing #ts 500");
 
-    // 有 ts 的 Doing→Doing：零改动（不重设起点）
+    // 有 ts 的规范 Doing→Doing：零改动（不重设起点）
+    let (mut tf, li) = one_task("## 日任务\n\n- [ ] (P1) a #pomo 10 #doing #ts 500\n");
+    tf.set_status_at(li, TaskStatus::Doing, 999).unwrap();
+    assert_eq!(tf.lines[li], "- [ ] (P1) a #pomo 10 #doing #ts 500");
+
+    // legacy #t 的 Doing→Doing：非规范，迁移并以新 now 重开段
+    //（产品路径不可达：运行中开始钮真禁用；此处钉死迁移语义）
     let (mut tf, li) = one_task("## 日任务\n\n- [ ] (P1) a #t 10 #doing #ts 500\n");
     tf.set_status_at(li, TaskStatus::Doing, 999).unwrap();
-    assert_eq!(tf.lines[li], "- [ ] (P1) a #t 10 #doing #ts 500");
+    assert_eq!(tf.lines[li], "- [ ] (P1) a #pomo 0 #doing #ts 999");
 }
 
-/// 手术清理：重复 #t 只留首个、多余 doing/paused/ts 全删；#overdue/#blocked/注记保留。
-/// 样例必须是 Doing 态（含 #paused 的行派生即 Paused，会走同态幂等短路零改动）。
+/// 手术清理：重复计时 token 全清，#pomo 原位占首个数值锚点；
+/// #overdue/#blocked/注记保留；未到期段作废不计数。
 #[test]
 fn v08_set_status_cleans_duplicates_keeps_others() {
     let (mut tf, li) = one_task("## 日任务\n\n- [ ] (P1) a #t 3 #doing #t 9 #ts 90 #overdue 补记9/2\n");
     tf.set_status_at(li, TaskStatus::Paused, 100).unwrap();
-    // base = 多 #t 后者胜 = 9；delta = 100-90 = 10 → 19；目标态追加在行尾（注记字节不动）
-    assert_eq!(tf.lines[li], "- [ ] (P1) a #t 19 #overdue 补记9/2 #paused");
+    // 多 #t 后者胜 = 9 → 折算 0；elapsed 10 作废；锚点后注记字节不动
+    assert_eq!(tf.lines[li], "- [ ] (P1) a #pomo 0 #overdue 补记9/2");
     assert!(tf.tasks[0].overdue);
 
-    // 同态幂等样例：已派生 Paused 的行再 set Paused，零字节改动
-    let (mut tf, li) = one_task("## 日任务\n\n- [ ] (P1) a #t 3 #paused #t 9 #doing #ts 7\n");
+    // 规范闲置态同态：零字节改动
+    let (mut tf, li) = one_task("## 日任务\n\n- [ ] (P1) a #pomo 9\n");
     let before = tf.lines[li].clone();
     tf.set_status_at(li, TaskStatus::Paused, 100).unwrap();
     assert_eq!(tf.lines[li], before);
 
-    // blocked + 原因原样穿过状态手术
+    // blocked + 原因原样穿过状态手术（段 11s 作废，legacy 迁移）
     let (mut tf, li) = one_task("## 日任务\n\n- [ ] (P1) b #blocked 等回复 #doing #t 4 #ts 9\n");
     tf.set_status_at(li, TaskStatus::Done, 20).unwrap();
-    assert_eq!(tf.lines[li], "- [x] (P1) b #blocked 等回复 #t 15");
+    assert_eq!(tf.lines[li], "- [x] (P1) b #blocked 等回复 #pomo 0");
     assert_eq!(tf.tasks[0].blocked_reason.as_deref(), Some("等回复"));
 }
 
-/// 状态封顶：累计 + 增量越过 CAP 时钳到 99:59:59。
+/// 番茄计数饱和：结算增量越过 POMO_CAP 钳到 65535；legacy 折算同样封顶。
 #[test]
 fn v08_set_status_caps_timer() {
-    let base = TIMER_CAP_SECS - 10; // 差 10 秒到顶
-    let (mut tf, li) = one_task(&format!("## 日任务\n\n- [ ] (P1) a #t {base} #doing #ts 100\n"));
-    tf.set_status_at(li, TaskStatus::Paused, 500).unwrap(); // delta 400 → 应封顶
-    assert_eq!(tf.tasks[0].timer_secs, TIMER_CAP_SECS);
-    assert!(tf.lines[li].contains(&format!("#t {TIMER_CAP_SECS}")));
+    let (mut tf, li) = one_task(&format!("## 日任务\n\n- [ ] (P1) a #pomo {} #doing #ts 100\n", POMO_CAP - 1));
+    tf.set_status_at(li, TaskStatus::Paused, 100 + POMO_SECS).unwrap(); // 到期结算 → 封顶
+    assert_eq!(tf.tasks[0].pomo_count, POMO_CAP);
+    assert!(tf.lines[li].contains(&format!("#pomo {POMO_CAP}")));
+
+    // legacy 折算封顶：原始秒远超 65535 番茄
+    let (tf, _) = one_task(&format!("## 日任务\n\n- [ ] (P1) a #t {}\n", POMO_CAP * POMO_SECS + 12345));
+    assert_eq!(tf.tasks[0].pomo_count, POMO_CAP);
 }
 
-/// 时钟倒拨（now < ts）：saturating 保证 delta=0，不 panic 不负数。
+/// 时钟倒拨（now < ts）：saturating 保证 elapsed=0，不 panic；段未到期作废不计数。
 #[test]
 fn v08_set_status_clock_backwards() {
     let (mut tf, li) = one_task("## 日任务\n\n- [ ] (P1) a #t 5 #doing #ts 1000\n");
     tf.set_status_at(li, TaskStatus::Paused, 200).unwrap();
-    assert_eq!(tf.lines[li], "- [ ] (P1) a #t 5 #paused");
+    assert_eq!(tf.lines[li], "- [ ] (P1) a #pomo 0");
+    assert_eq!(tf.tasks[0].pomo_count, 0);
 }
 
-/// Todo 直接完成后取消：复活回 Doing，累计（0）不清零、起点重设。
+/// Todo 直接完成后复活：从未开始不初始化 #pomo；复活闲置后再开始才落 #pomo 0。
 #[test]
 fn v08_todo_done_then_revive() {
     let (mut tf, li) = one_task("## 日任务\n\n- [ ] (P1) 直接完成\n");
     tf.set_status_at(li, TaskStatus::Done, 100).unwrap();
-    assert_eq!(tf.lines[li], "- [x] (P1) 直接完成 #t 0");
-    tf.set_status_at(li, TaskStatus::Doing, 300).unwrap();
-    assert_eq!(tf.lines[li], "- [ ] (P1) 直接完成 #t 0 #doing #ts 300");
+    assert_eq!(tf.lines[li], "- [x] (P1) 直接完成");
+    assert!(!tf.tasks[0].pomo_started);
+    tf.set_status_at(li, TaskStatus::Paused, 300).unwrap();
+    assert_eq!(tf.lines[li], "- [ ] (P1) 直接完成");
+    tf.set_status_at(li, TaskStatus::Doing, 400).unwrap();
+    assert_eq!(tf.lines[li], "- [ ] (P1) 直接完成 #pomo 0 #doing #ts 400");
 }
 
 /// 多行子行：解析剥两空格结构缩进；replace_sub_lines 替换/清空；块边界含缩进空白行。
@@ -632,15 +656,17 @@ fn v08_remove_flag_all_duplicates() {
 }
 
 
+/// 闲置化手术的注记保真：legacy #t 原位换 #pomo、#doing/#ts 清除后，
+/// 注记留在锚点之后不进 content；回读派生一致。
 #[test]
-fn pause_preserves_annotation_between_timer_and_status() {
+fn idle_preserves_annotation_between_timer_and_status() {
     for input in ["- [ ] A #t 45 补记 #doing #ts 100", "- [ ] A #t 45 #doing 补记 #ts 100", "- [ ] A #t 45 #doing 补记"] {
         let mut f = TodoFile::parse(input);
-        let expected_secs = if input.contains("#ts") { 55 } else { 45 };
         f.set_status_at(0, app_lib::parser::TaskStatus::Paused, 110).unwrap();
-        assert_eq!(f.lines[0], format!("- [ ] A #t {expected_secs} 补记 #paused"));
+        assert_eq!(f.lines[0], "- [ ] A #pomo 0 补记");
         let again = TodoFile::parse(&f.serialize());
-        assert_eq!(again.tasks[0].timer_secs, expected_secs);
+        assert_eq!(again.tasks[0].pomo_count, 0);
+        assert!(again.tasks[0].pomo_started);
         assert_eq!(again.tasks[0].status, app_lib::parser::TaskStatus::Paused);
         assert_eq!(again.tasks[0].display, "A 补记");
         assert!(!again.tasks[0].timer_invalid);
@@ -648,12 +674,12 @@ fn pause_preserves_annotation_between_timer_and_status() {
 }
 
 #[test]
-fn pause_preserves_annotation_after_timestamp() {
+fn idle_preserves_annotation_after_timestamp() {
     let mut f = TodoFile::parse("- [ ] A #t 45 #doing #ts 100 补记  原文");
     f.set_status_at(0, app_lib::parser::TaskStatus::Paused, 110).unwrap();
-    assert_eq!(f.lines[0], "- [ ] A #t 55 补记  原文 #paused");
+    assert_eq!(f.lines[0], "- [ ] A #pomo 0 补记  原文");
     let again = TodoFile::parse(&f.serialize());
-    assert_eq!(again.tasks[0].timer_secs, 55);
+    assert_eq!(again.tasks[0].pomo_count, 0);
     assert_eq!(again.tasks[0].status, app_lib::parser::TaskStatus::Paused);
     assert_eq!(again.tasks[0].display, "A 补记  原文");
     assert_eq!(again.tasks[0].timer_started_at, None);

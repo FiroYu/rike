@@ -408,53 +408,56 @@ fn scheduler_tick_silent_pulls_remote_changes() {
 
 const DAY_TEXT2: &str = "# 2026-09-10 (周四)\n\n## 日任务\n- [ ] (P1) [工作] 联系供应商 #doing\n- [ ] (P2) [个人] 买咖啡\n";
 
-/// Sprint 4（v0.8 语义更新）：完成即不再「进行中」——set_checked(true) 连带清
-/// #doing，且首离待开始即写 `#t 0`（零值不可省略）；取消勾选 = 复活为暂停。
+/// 无计数、无合法起点的旧 #doing 不虚构番茄，完成和复活只清理状态。
 #[test]
 fn set_checked_true_strips_doing() {
-    let (a, _url) = setup_store("strip-doing");
-    let store = StickyStore::new(&a);
+    let temp = tempfile::tempdir().unwrap();
+    let a = temp.path();
+    git(a, &["init"]);
+    let store = StickyStore::new(a);
     let day = FileKind::Day(d("2026-09-10"));
-    write(&a, "days/2026-09-10.md", DAY_TEXT2);
+    write(a, "days/2026-09-10.md", DAY_TEXT2);
 
     let v = store.get_view("default", day).unwrap();
     let li = v.tasks[0].line_idx;
     assert!(v.tasks[0].doing);
 
     let r = store.set_checked("default", &day, li, true, v.base_version).unwrap();
-    let text = read(&a, "days/2026-09-10.md");
-    assert!(text.contains("- [x] (P1) [工作] 联系供应商 #t 0\n"), "勾选且无 #doing（v0.8 落盘 #t 0）: {text}");
+    let text = read(a, "days/2026-09-10.md");
+    assert!(text.contains("- [x] (P1) [工作] 联系供应商\n"), "清除无起点的 #doing: {text}");
 
-    // v0.8.1：取消勾选 = 复活为暂停（清 [x]，写 #paused，累计冻结无 #ts）
+    // 从未初始化计数的任务取消完成仍无计时标签。
     let v2 = store.get_view("default", day).unwrap();
     store.set_checked("default", &day, li, false, v2.base_version).unwrap();
-    let revived = read(&a, "days/2026-09-10.md");
-    assert!(revived.contains("#t 0 #paused"));
+    let revived = read(a, "days/2026-09-10.md");
+    assert!(!revived.contains("#pomo") && !revived.contains("#paused"));
     assert!(!revived.contains("#ts"));
     let task = &store.get_view("default", day).unwrap().tasks[0];
-    assert_eq!(task.status, TaskStatus::Paused);
+    assert_eq!(task.status, TaskStatus::Todo);
     assert_eq!(task.timer_secs, v2.tasks[0].timer_secs);
     let _ = r;
 }
 
-/// Sprint 4：删除→撤销恢复全链（DeleteResult 携带原文，restore 原样插回）。
+/// 删除→撤销恢复全链：返回块清除运行标签，restore 原样插回。
 #[test]
-fn delete_then_undo_restores_byte_exact() {
-    let (a, _url) = setup_store("delete-undo");
-    let store = StickyStore::new(&a);
+fn delete_then_undo_restores_idle_block() {
+    let temp = tempfile::tempdir().unwrap();
+    let a = temp.path();
+    git(a, &["init"]);
+    let store = StickyStore::new(a);
     let day = FileKind::Day(d("2026-09-10"));
     let orig = DAY_TEXT2;
-    write(&a, "days/2026-09-10.md", orig);
+    write(a, "days/2026-09-10.md", orig);
 
     let v = store.get_view("default", day).unwrap();
     let li = v.tasks[0].line_idx;
     let r = store.delete_task("default", &day, li, v.base_version).unwrap();
-    assert_eq!(r.removed, vec!["- [ ] (P1) [工作] 联系供应商 #doing"]);
-    assert!(!read(&a, "days/2026-09-10.md").contains("联系供应商"));
+    assert_eq!(r.removed, vec!["- [ ] (P1) [工作] 联系供应商"]);
+    assert!(!read(a, "days/2026-09-10.md").contains("联系供应商"));
 
-    // 撤销：插回原文 → 文件字节还原
+    // 撤销保留清理后的块，失效段不复活。
     store.restore_deleted("default", &day, r.line_idx, r.removed.clone(), r.base_version).unwrap();
-    assert_eq!(read(&a, "days/2026-09-10.md"), orig);
+    assert_eq!(read(a, "days/2026-09-10.md"), orig.replace(" #doing", ""));
 
     // 空恢复拒绝（防呆）
     let v2 = store.get_view("default", day).unwrap();
@@ -525,112 +528,77 @@ fn v08_parse_status_words() {
     assert_eq!(parse_status("blocked").unwrap_err().code, "bad_request");
 }
 
-/// set_task_status 全链：待开始→进行中（写 #t 0 + ts）→暂停（结算）→完成→复活。
-/// ts 是服务端时钟，只断言结构不锁具体值。
+/// 开始→完成→取消完成恢复闲置；paused 只允许 Done 进入。
 #[test]
-fn v08_set_task_status_chain() {
-    let (a, _url) = setup_store("v08-status-chain");
-    let store = StickyStore::new(&a);
+fn pomo_set_task_status_chain() {
+    let temp = tempfile::tempdir().unwrap();
+    let a = temp.path();
+    git(a, &["init"]);
+    let store = StickyStore::new(a);
     let day = FileKind::Day(d("2026-09-10"));
-    write(&a, "days/2026-09-10.md", DAY_TEXT);
+    write(a, "days/2026-09-10.md", DAY_TEXT);
     let v = store.get_view("default", day).unwrap();
     let li = v.tasks[0].line_idx;
-    assert_eq!(v.tasks[0].status, TaskStatus::Todo);
-    assert_eq!(v.tasks[0].timer_secs, 0);
-
-    // 待开始 → 进行中
-    let r1 = store.set_task_status("default", &day, li, TaskStatus::Doing, v.base_version).unwrap();
-    let text = read(&a, "days/2026-09-10.md");
-    assert!(text.contains("- [ ] (P1) [工作] 写周报 #t 0 #doing #ts "), "落盘: {text}");
-    // 视图派生：Doing、计时起点有值
-    let v2 = store.get_view("default", day).unwrap();
-    assert_eq!(v2.tasks[0].status, TaskStatus::Doing);
-    assert!(v2.tasks[0].timer_started_at.is_some());
-
-    // 进行中 → 暂停（真实时钟下 delta 不可控，只验结构与 ts 清除）
-    store.set_task_status("default", &day, li, TaskStatus::Paused, r1.base_version).unwrap();
-    let text = read(&a, "days/2026-09-10.md");
-    assert!(text.contains("#paused"), "暂停标签: {text}");
-    assert!(!text.contains("#ts"), "暂停删起点: {text}");
-    let v3 = store.get_view("default", day).unwrap();
-    assert_eq!(v3.tasks[0].status, TaskStatus::Paused);
-    assert_eq!(v3.tasks[0].timer_started_at, None);
-
-    // 暂停 → 完成
-    let r3 = store.set_task_status("default", &day, li, TaskStatus::Done, v3.base_version).unwrap();
-    let text = read(&a, "days/2026-09-10.md");
-    assert!(text.contains("- [x] (P1) [工作] 写周报 #t "), "完成态: {text}");
-    assert!(!text.contains("#doing") && !text.contains("#paused"));
-
-    // 完成 → 复活进行中（续计不清零：#t 保留原值）
-    store.set_task_status("default", &day, li, TaskStatus::Doing, r3.base_version).unwrap();
-    let text = read(&a, "days/2026-09-10.md");
-    assert!(text.contains("- [ ] (P1) [工作] 写周报 #t 0 #doing #ts "), "复活: {text}");
+    assert!(!v.tasks[0].pomo_started);
+    assert_eq!(store.set_task_status("default", &day, li, TaskStatus::Paused, v.base_version).unwrap_err().code, "bad_request");
+    let r = store.set_task_status("default", &day, li, TaskStatus::Doing, v.base_version).unwrap();
+    assert!(read(a, "days/2026-09-10.md").contains("写周报 #pomo 0 #doing #ts "));
+    assert_eq!(store.set_task_status("default", &day, li, TaskStatus::Paused, r.base_version).unwrap_err().code, "bad_request");
+    let r = store.set_task_status("default", &day, li, TaskStatus::Done, r.base_version).unwrap();
+    assert!(read(a, "days/2026-09-10.md").contains("- [x] (P1) [工作] 写周报 #pomo 0"));
+    let r = store.set_task_status("default", &day, li, TaskStatus::Paused, r.base_version).unwrap();
+    let v = store.get_view("default", day).unwrap();
+    assert_eq!(v.tasks[0].status, TaskStatus::Paused);
+    assert_eq!(v.tasks[0].pomo_count, 0);
+    assert!(v.tasks[0].pomo_started);
+    assert_eq!(v.tasks[0].timer_started_at, None);
+    assert!(!read(a, "days/2026-09-10.md").contains("#paused"));
+    store.set_task_status("default", &day, li, TaskStatus::Doing, r.base_version).unwrap();
+    assert!(store.get_view("default", day).unwrap().tasks[0].timer_started_at.is_some());
 }
 
-/// edit 空操作短路：同态 set_status 零 pending、文件字节不变、版本原样返回。
 #[test]
-fn v08_edit_noop_short_circuit() {
-    let (a, _url) = setup_store("v08-noop");
-    let store = StickyStore::new(&a);
+fn pomo_edit_noop_short_circuit() {
+    let temp = tempfile::tempdir().unwrap();
+    let a = temp.path();
+    git(a, &["init"]);
+    let store = StickyStore::new(a);
     let day = FileKind::Day(d("2026-09-10"));
-    write(&a, "days/2026-09-10.md", DAY_TEXT);
-
+    write(a, "days/2026-09-10.md", DAY_TEXT);
     let v = store.get_view("default", day).unwrap();
     let li = v.tasks[0].line_idx;
-    let bv: u64 = v.base_version;
-
-    // 待开始 → Paused（首离即写 #t 0）
-    let r = store.set_task_status("default", &day, li, TaskStatus::Paused, bv).unwrap();
+    let r = store.set_task_status("default", &day, li, TaskStatus::Doing, v.base_version).unwrap();
     assert_eq!(store.take_pending_edits(), 1);
-    let after = read(&a, "days/2026-09-10.md");
-
-    // 同态 Paused → Paused：零写盘零 pending，版本原样
-    let r2 = store.set_task_status("default", &day, li, TaskStatus::Paused, r.base_version).unwrap();
-    assert_eq!(store.take_pending_edits(), 0, "同态短路不计 pending");
-    assert_eq!(read(&a, "days/2026-09-10.md"), after, "文件字节不变");
-    assert_eq!(r2.base_version, r.base_version, "版本原样返回");
+    let after = read(a, "days/2026-09-10.md");
+    let r2 = store.set_task_status("default", &day, li, TaskStatus::Doing, r.base_version).unwrap();
+    assert_eq!(store.take_pending_edits(), 0);
+    assert_eq!(read(a, "days/2026-09-10.md"), after);
+    assert_eq!(r2.base_version, r.base_version);
 }
 
-/// 旧命令适配：set_flag(doing, on) 与 set_checked 的状态机语义。
 #[test]
-fn v08_legacy_commands_adapted() {
-    let (a, _url) = setup_store("v08-legacy");
-    let store = StickyStore::new(&a);
+fn pomo_legacy_commands_cannot_pause() {
+    let temp = tempfile::tempdir().unwrap();
+    let a = temp.path();
+    git(a, &["init"]);
+    let store = StickyStore::new(a);
     let day = FileKind::Day(d("2026-09-10"));
-    write(&a, "days/2026-09-10.md", DAY_TEXT);
-
-    // overdue 恒拒（只读）
+    write(a, "days/2026-09-10.md", DAY_TEXT);
     let v = store.get_view("default", day).unwrap();
     let li = v.tasks[0].line_idx;
     assert_eq!(store.set_flag("default", &day, li, Flag::Overdue, true, 0).unwrap_err().code, "bad_request");
-
-    // set_flag(doing, true)：待开始 → 进行中
     let r = store.set_flag("default", &day, li, Flag::Doing, true, v.base_version).unwrap();
-    assert!(read(&a, "days/2026-09-10.md").contains("#doing #ts "));
-
-    // set_flag(doing, false)：进行中 → 暂停
-    let r2 = store.set_flag("default", &day, li, Flag::Doing, false, r.base_version).unwrap();
-    assert!(read(&a, "days/2026-09-10.md").contains("#paused"));
-
-    // set_flag(doing, false) 于非进行中：无操作（先排空此前两笔真实编辑的 pending）
-    let _ = store.take_pending_edits();
-    store.set_flag("default", &day, li, Flag::Doing, false, r2.base_version).unwrap();
-    assert_eq!(store.take_pending_edits(), 0, "无操作不计 pending");
-
-    // set_checked(true)：任何态 → 完成
-    let r3 = store.set_checked("default", &day, li, true, r2.base_version).unwrap();
-    assert!(read(&a, "days/2026-09-10.md").contains("- [x] "));
-
-    let frozen = store.get_view("default", day).unwrap().tasks[0].timer_secs;
-    // set_checked(false) 于完成 → 复活暂停；于未完成 → 无操作
-    store.set_checked("default", &day, li, false, r3.base_version).unwrap();
-    let text = read(&a, "days/2026-09-10.md");
-    assert!(text.contains("#paused"));
-    assert!(!text.contains("#ts"));
+    assert_eq!(store.set_flag("default", &day, li, Flag::Doing, false, r.base_version).unwrap_err().code, "bad_request");
+    let r = store.set_checked("default", &day, li, true, r.base_version).unwrap();
+    let r = store.set_checked("default", &day, li, false, r.base_version).unwrap();
     let task = &store.get_view("default", day).unwrap().tasks[0];
     assert_eq!(task.status, TaskStatus::Paused);
-    assert_eq!(task.timer_secs, frozen);
+    assert_eq!(task.pomo_count, 0);
+    assert_eq!(task.timer_started_at, None);
+    let _ = store.take_pending_edits();
+    let r2 = store.set_flag("default", &day, li, Flag::Doing, false, r.base_version).unwrap();
+    assert_eq!(r2.base_version, r.base_version);
+    assert_eq!(store.take_pending_edits(), 0);
 }
 
 /// set_content 子行三态：None 保留 / [] 清空 / 非空整体替换。
@@ -704,27 +672,79 @@ fn v08_copy_leftover_keeps_sub_lines() {
 }
 
 #[test]
-fn unchecked_done_preserves_nonzero_frozen_timer() {
+fn unchecked_done_migrates_nonzero_pomo_count() {
     let temp = tempfile::tempdir().unwrap();
     let a = temp.path();
     git(a, &["init"]);
     let store = StickyStore::new(a);
     let day = FileKind::Day(d("2026-09-10"));
-    write(a, "days/2026-09-10.md", "## 日任务\n- [x] A #t 120\n");
+    write(a, "days/2026-09-10.md", "## 日任务\n- [x] A #t 1500\n");
     let v = store.get_view("default", day).unwrap();
     store.set_checked("default", &day, v.tasks[0].line_idx, false, v.base_version).unwrap();
     let task = &store.get_view("default", day).unwrap().tasks[0];
     assert_eq!(task.status, TaskStatus::Paused);
-    assert_eq!(task.timer_secs, 120);
+    assert_eq!(task.pomo_count, 1);
+    assert!(task.pomo_started);
     assert_eq!(task.timer_started_at, None);
     assert!(!read(a, "days/2026-09-10.md").contains("#ts"));
 }
 
 #[test]
-fn checkbox_copy_describes_paused_revival() {
-    let source = include_str!("../../src/render.ts");
-    assert!(source.contains("取消完成并恢复为暂停"));
-    assert!(source.contains("取消勾选：恢复为暂停，累计计时冻结不清零；点状态钮继续计时"));
-    assert!(!source.contains("取消完成并继续计时"));
-    assert!(!source.contains("复活回进行中，计时续跑"));
+fn checkbox_revival_has_idle_pomo_wire_semantics() {
+    let mut file = app_lib::parser::TodoFile::parse("- [x] A #pomo 2\n");
+    file.set_status_at(0, TaskStatus::Paused, 999).unwrap();
+    assert_eq!(file.lines[0], "- [ ] A #pomo 2");
+    assert_eq!(file.tasks[0].timer_started_at, None);
+    assert_eq!(file.tasks[0].status, TaskStatus::Paused);
+}
+
+#[test]
+fn pomo_settle_noop_stale_replay_and_delete_restore() {
+    let temp = tempfile::tempdir().unwrap();
+    let a = temp.path();
+    git(a, &["init"]);
+    let store = StickyStore::new(a);
+    let day = FileKind::Day(d("2026-09-10"));
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let ts = now - 1500;
+    write(a, "days/2026-09-10.md", &format!("## 日任务\n- [ ] A #pomo 0 #doing #ts {ts}\n  子行\n"));
+    let v = store.get_view("default", day).unwrap();
+    let li = v.tasks[0].line_idx;
+    let r = store.settle_pomo("default", &day, li, 1, ts + 1).unwrap();
+    assert_eq!(r.base_version, v.base_version, "段不匹配时陈旧版本也成功 no-op");
+    assert_eq!(store.take_pending_edits(), 0);
+    let before = read(a, "days/2026-09-10.md");
+    assert_eq!(store.settle_pomo("default", &day, li, 1, ts).unwrap_err().code, "stale");
+    assert_eq!(read(a, "days/2026-09-10.md"), before);
+    let r = store.settle_pomo("default", &day, li, v.base_version, ts).unwrap();
+    assert_eq!(store.take_pending_edits(), 1);
+    assert_eq!(store.get_view("default", day).unwrap().tasks[0].pomo_count, 1);
+    let replay = store.settle_pomo("default", &day, li, v.base_version, ts).unwrap();
+    assert_eq!(replay.base_version, r.base_version);
+    assert_eq!(store.take_pending_edits(), 0);
+    assert_eq!(store.settle_pomo("default", &day, 99, 1, ts).unwrap().base_version, r.base_version);
+    let absent = FileKind::Day(d("2026-09-11"));
+    assert_eq!(store.settle_pomo("default", &absent, 0, 1, ts).unwrap().base_version, 0);
+    assert!(!absent.abs_path(a).exists());
+
+    // 未到期请求不改文件，删除使段作废，撤销只恢复闲置块。
+    write(a, "days/2026-09-10.md", &format!("## 日任务\n- [ ] A #pomo 1 #doing #ts {now}\n  子行\n"));
+    let v = store.get_view("default", day).unwrap();
+    assert_eq!(store.settle_pomo("default", &day, li, 1, now).unwrap().base_version, v.base_version);
+    let deleted = store.delete_task("default", &day, li, v.base_version).unwrap();
+    assert_eq!(deleted.removed, vec!["- [ ] A #pomo 1".to_string(), "  子行".to_string()]);
+    store.restore_deleted("default", &day, li, deleted.removed, deleted.base_version).unwrap();
+    let task = &store.get_view("default", day).unwrap().tasks[0];
+    assert_eq!(task.status, TaskStatus::Paused);
+    assert_eq!(task.timer_started_at, None);
+
+    // 已到期删除先加一，返回块和撤销结果都不含运行段。
+    write(a, "days/2026-09-10.md", &format!("## 日任务\n- [ ] A #pomo 1 #doing #ts {ts}\n"));
+    let v = store.get_view("default", day).unwrap();
+    let deleted = store.delete_task("default", &day, li, v.base_version).unwrap();
+    assert_eq!(deleted.removed, vec!["- [ ] A #pomo 2".to_string()]);
+    store.restore_deleted("default", &day, li, deleted.removed, deleted.base_version).unwrap();
+    let task = &store.get_view("default", day).unwrap().tasks[0];
+    assert_eq!(task.pomo_count, 2);
+    assert_eq!(task.timer_started_at, None);
 }
