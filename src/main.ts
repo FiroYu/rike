@@ -44,6 +44,13 @@ function normalizeStickerContent(content: string): string {
   const { title, body } = splitStickerContent(content);
   return composeStickerContent(title, body);
 }
+function stickyDateText(id: string): string {
+  const ms = Number(id.slice(0, 13));
+  if (!Number.isFinite(ms) || ms <= 0) return "";
+  const date = new Date(ms);
+  if (Number.isNaN(date.getTime())) return "";
+  return `${date.getFullYear()}.${String(date.getMonth() + 1).padStart(2, "0")}.${String(date.getDate()).padStart(2, "0")}`;
+}
 
 function initBoardEditorPage(): void {
   document.body.classList.add("editor-page");
@@ -56,6 +63,7 @@ function initBoardEditorPage(): void {
   const paper = mask.querySelector<HTMLElement>(".board-editor")!;
   const title = mask.querySelector<HTMLInputElement>("#board-title")!;
   const area = mask.querySelector<HTMLTextAreaElement>("#board-area")!;
+  const dateText = mask.querySelector<HTMLElement>(".board-editor-date")!;
   const zoom = mask.querySelector<HTMLButtonElement>("#board-zoom")!;
   const resize = mask.querySelector<HTMLElement>(".board-zoom-resize")!;
   mask.hidden = false;
@@ -134,6 +142,7 @@ function initBoardEditorPage(): void {
       const split = splitStickerContent(content);
       title.value = split.title;
       area.value = split.body;
+      dateText.textContent = stickyDateText(ev.payload.id);
       paper.style.removeProperty("width");
       paper.style.removeProperty("height");
       activeId = ev.payload.id;
@@ -545,7 +554,7 @@ function dirtyNotes(): HTMLTextAreaElement[] {
     .filter(input => input.value !== input.dataset.loaded);
 }
 
-interface BoardSticker { id: string; content: string; baseVersion: string }
+interface BoardSticker { id: string; date: string; content: string; baseVersion: string }
 const fallbackStickyPapers = ["#f0e9d2", "#e2e8ec", "#eee2de", "#e3ebdd", "#ebe9e3"];
 function readStickyPapers(): string[] {
   const styles = getComputedStyle(document.documentElement);
@@ -557,6 +566,7 @@ const boardCount = root.querySelector<HTMLElement>("#board-count")!;
 const boardStatus = root.querySelector<HTMLElement>("#board-status")!;
 const boardMask = root.querySelector<HTMLElement>("#board-mask")!;
 const boardEditorElement = root.querySelector<HTMLElement>(".board-editor")!;
+const boardEditorDate = root.querySelector<HTMLElement>(".board-editor-date")!;
 const boardZoom = root.querySelector<HTMLButtonElement>("#board-zoom")!;
 const boardTitle = root.querySelector<HTMLInputElement>("#board-title")!;
 const boardArea = root.querySelector<HTMLTextAreaElement>("#board-area")!;
@@ -578,7 +588,6 @@ let boardRestoreRequested = false;
 let boardRestored: (() => void) | null = null;
 // Serialize set_board_window calls so a quick toggle cannot restore before enlargement finishes.
 let boardWindowChange: Promise<void> = Promise.resolve();
-let boardDate = todayStr();
 let boardNotebookId = app.notebookId;
 
 function boardHash(s: string): number {
@@ -642,11 +651,9 @@ function renderBoard(): void {
     const body = document.createElement("div");
     body.className = "board-sticker-text";
     body.textContent = first < 0 ? "" : lines.slice(first + 1).join("\n");
-    const time = document.createElement("span");
-    time.className = "board-sticker-time";
-    const ms = Number(sticker.id.slice(0, 13));
-    time.textContent = Number.isFinite(ms) && ms > 0
-      ? new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false }) : "";
+    const dateText = document.createElement("span");
+    dateText.className = "board-sticker-date";
+    dateText.textContent = stickyDateText(sticker.id);
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "board-sticker-x";
@@ -659,7 +666,7 @@ function renderBoard(): void {
       ev.preventDefault();
       openBoardEditor(sticker, false);
     });
-    paper.append(pin, title, body, time, remove);
+    paper.append(pin, title, body, dateText, remove);
     boardGrid.append(paper);
   });
 }
@@ -668,20 +675,17 @@ async function loadBoard(): Promise<void> {
   if (boardEditor || boardSaving) return;
   const id = ++boardRequestId;
   const notebookId = app.notebookId;
-  const date = app.dayDate ?? todayStr();
-  if (boardNotebookId !== notebookId || boardDate !== date) {
+  if (boardNotebookId !== notebookId) {
     boardNotebookId = notebookId;
-    boardDate = date;
     stickies = [];
     hideBoardUndo();
     renderBoard();
   }
   try {
-    const dto = await api.listSticky(notebookId, date);
-    if (id !== boardRequestId || notebookId !== app.notebookId || date !== (app.dayDate ?? todayStr()) || boardEditor) return;
+    const dto = await api.listSticky(notebookId);
+    if (id !== boardRequestId || notebookId !== app.notebookId || boardEditor) return;
     boardNotebookId = notebookId;
-    boardDate = date;
-    stickies = dto.stickies.map(s => ({ id: s.id, content: s.content, baseVersion: s.base_version }));
+    stickies = dto.stickies.map(s => ({ id: s.id, date: s.date, content: s.content, baseVersion: s.base_version }));
     renderBoard();
     boardStatus.textContent = "";
   } catch (error) {
@@ -694,16 +698,14 @@ async function createBoardSticker(): Promise<void> {
   boardSaving = true;
   ++boardRequestId;
   const notebookId = app.notebookId;
-  const date = app.dayDate ?? todayStr();
   try {
-    const created = await api.addSticky(notebookId, date, "");
-    if (notebookId !== app.notebookId || date !== (app.dayDate ?? todayStr())) {
-      await api.deleteSticky(notebookId, date, created.id, created.base_version);
+    const created = await api.addSticky(notebookId, "");
+    if (notebookId !== app.notebookId) {
+      await api.deleteSticky(notebookId, created.date, created.id, created.base_version);
       return;
     }
     boardNotebookId = notebookId;
-    boardDate = date;
-    const sticker = { id: created.id, content: "", baseVersion: created.base_version };
+    const sticker = { id: created.id, date: created.date, content: "", baseVersion: created.base_version };
     stickies.push(sticker);
     boardSaving = false;
     openBoardEditor(sticker, true);
@@ -712,7 +714,7 @@ async function createBoardSticker(): Promise<void> {
   } catch (error) { boardStatus.textContent = boardError(error); }
   finally {
     boardSaving = false;
-    if (notebookId !== app.notebookId || date !== (app.dayDate ?? todayStr())) void loadBoard();
+    if (notebookId !== app.notebookId) void loadBoard();
   }
 }
 
@@ -723,6 +725,7 @@ function openBoardEditor(sticker: BoardSticker, isNew: boolean): void {
   const split = splitStickerContent(sticker.content);
   boardTitle.value = split.title;
   boardArea.value = split.body;
+  boardEditorDate.textContent = stickyDateText(sticker.id);
   boardEditorElement.style.setProperty("--ed-paper", stickyPapers[adjColors()[stickies.indexOf(sticker)]]);
   boardMask.hidden = false;
   boardTitle.focus();
@@ -748,7 +751,7 @@ function setBoardZoom(zoomed: boolean): void {
     if (boardZoomed) return;
     boardZoomed = true;
     pendingBoardZoom = {
-      notebookId: boardNotebookId, date: boardDate, id: boardEditor.sticker.id,
+      notebookId: boardNotebookId, date: boardEditor.sticker.date, id: boardEditor.sticker.id,
       content: composeStickerContent(boardTitle.value, boardArea.value),
       paper: getComputedStyle(boardEditorElement).getPropertyValue("--ed-paper").trim(),
       isNew: boardEditor.isNew, typed: boardEditor.typed,
@@ -779,7 +782,7 @@ async function closeBoardEditor(): Promise<void> {
   if (current.isNew && !current.typed) {
     boardSaving = true;
     try {
-      await api.deleteSticky(boardNotebookId, boardDate, current.sticker.id, current.sticker.baseVersion);
+      await api.deleteSticky(boardNotebookId, current.sticker.date, current.sticker.id, current.sticker.baseVersion);
       stickies = stickies.filter(s => s.id !== current.sticker.id);
       renderBoard();
     } catch (error) { boardStatus.textContent = boardError(error); return; }
@@ -792,7 +795,7 @@ async function closeBoardEditor(): Promise<void> {
   resetBoardZoom();
   boardMask.hidden = true;
   if (boardDirty) { boardDirty = false; void loadBoard(); }
-  if (boardNotebookId !== app.notebookId || boardDate !== (app.dayDate ?? todayStr())) void loadBoard();
+  if (boardNotebookId !== app.notebookId) void loadBoard();
 }
 
 function saveBoardEditor(): Promise<boolean> {
@@ -807,7 +810,7 @@ function saveBoardEditor(): Promise<boolean> {
   boardEditorSaving = true;
   boardSavePromise = (async () => {
     try {
-      const result = await api.saveSticky(boardNotebookId, boardDate, current.sticker.id, content, current.sticker.baseVersion);
+      const result = await api.saveSticky(boardNotebookId, current.sticker.date, current.sticker.id, content, current.sticker.baseVersion);
       current.sticker.content = content;
       current.sticker.baseVersion = result.base_version;
       boardEditor = null;
@@ -816,7 +819,7 @@ function saveBoardEditor(): Promise<boolean> {
       renderBoard();
       boardStatus.textContent = "已保存";
       if (boardDirty) { boardDirty = false; void loadBoard(); }
-      if (boardNotebookId !== app.notebookId || boardDate !== (app.dayDate ?? todayStr())) void loadBoard();
+      if (boardNotebookId !== app.notebookId) void loadBoard();
       return true;
     } catch (error) {
       if (error instanceof ApiError && error.code === "stale") {
@@ -862,7 +865,7 @@ async function deleteBoardSticker(id: string): Promise<void> {
   if (!sticker) return;
   boardSaving = true;
   ++boardRequestId;
-  const notebookId = boardNotebookId, date = boardDate;
+  const notebookId = boardNotebookId, date = sticker.date;
   try {
     const result = await api.deleteSticky(notebookId, date, id, sticker.baseVersion);
     stickies = stickies.filter(s => s.id !== id);
@@ -884,7 +887,7 @@ async function deleteBoardSticker(id: string): Promise<void> {
   } catch (error) { boardStatus.textContent = boardError(error); }
   finally {
     boardSaving = false;
-    if (notebookId !== app.notebookId || date !== (app.dayDate ?? todayStr())) void loadBoard();
+    if (notebookId !== app.notebookId) void loadBoard();
   }
 }
 

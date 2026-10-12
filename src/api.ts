@@ -8,8 +8,8 @@ export type TaskStatus = "todo" | "doing" | "paused" | "done";
 
 export interface NoteDayDto { date: string; weekday: string; content: string; base_version: string }
 export interface NotesDto { kind: ViewKind; date: string; days: NoteDayDto[] }
-export interface StickyDto { id: string; content: string; base_version: string }
-export interface StickiesDto { date: string; weekday: string; stickies: StickyDto[] }
+export interface StickyDto { id: string; date: string; content: string; base_version: string }
+export interface StickiesDto { stickies: StickyDto[] }
 
 export interface Notebook { id: string; name: string; base_version: string }
 export interface TaskSource { kind: ViewKind; date: string; rel_path: string; base_version: string }
@@ -121,10 +121,10 @@ export const api = {
     call<NotesDto>("get_notes", { notebookId, kind, date }),
   saveNote: (notebookId: string, date: string, content: string, baseVersion: string) =>
     call<{ base_version: string }>("save_note", { notebookId, date, content, baseVersion }),
-  listSticky: (notebookId: string, date?: string) =>
-    call<StickiesDto>("list_stickies", { notebookId, date }),
-  addSticky: (notebookId: string, date: string, content: string) =>
-    call<{ id: string; base_version: string }>("add_sticky", { notebookId, date, content }),
+  listSticky: (notebookId: string) =>
+    call<StickiesDto>("list_stickies", { notebookId }),
+  addSticky: (notebookId: string, content: string) =>
+    call<{ id: string; date: string; base_version: string }>("add_sticky", { notebookId, content }),
   saveSticky: (notebookId: string, date: string, id: string, content: string, baseVersion: string) =>
     call<{ base_version: string }>("save_sticky", { notebookId, date, id, content, baseVersion }),
   deleteSticky: (notebookId: string, date: string, id: string, baseVersion: string) =>

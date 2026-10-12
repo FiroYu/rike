@@ -751,7 +751,7 @@ html[data-theme="glass"] :is(#sync-settings-form input, .notes-input:focus, .add
   .board-sticker-title { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; font: 700 12px/1.35 var(--hand); color: var(--ink); word-break: break-all; }
   .board-sticker-title.is-empty { font-style: italic; color: var(--ink-3); }
   .board-sticker-text { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; margin-top: 5px; font: 10.5px/1.45 var(--sans); color: var(--ink-2); white-space: pre-line; word-break: break-all; }
-  .board-sticker-time { position: absolute; left: 9px; bottom: 7px; font: 9px var(--mono); color: var(--ink-3); }
+  .board-sticker-date { position: absolute; right: 9px; bottom: 7px; font: 10px var(--hand); color: var(--ink-3); }
   .board-sticker-x { position: absolute; top: 8px; right: 8px; width: 18px; height: 18px; border: 0; border-radius: 50%; background: transparent; color: var(--ink); opacity: 0; cursor: pointer; }
   .board-sticker:hover .board-sticker-x, .board-sticker:focus-within .board-sticker-x { opacity: 1; }
   .board-sticker-x:hover { background: var(--accent); color: var(--panel); }
@@ -770,6 +770,7 @@ html[data-theme="glass"] :is(#sync-settings-form input, .notes-input:focus, .add
   #board-title::placeholder { color: var(--ink-3); font-style: italic; font-weight: 400; }
   #board-area { display: block; width: 100%; flex: 1; min-height: 0; max-height: none; height: auto; resize: none; overflow-y: auto; scrollbar-width: none; padding: 12px 21px 20px; border: 0; background: var(--ed-paper,#f0e9d2); color: var(--ink); font: 13px/1.6 var(--sans); }
   #board-area:focus-visible { outline: none; }
+  .board-editor-date { position: absolute; right: 14px; bottom: 34px; font: 14px var(--hand); color: var(--ink-3); pointer-events: none; }
   .board-shortcuts { flex: 0 0 auto; padding: 7px 14px 9px; color: var(--ink-3); font: 10px/1.4 var(--sans); text-align: center; white-space: nowrap; }
   .board-shortcuts span { padding: 0 4px; }
   #board-zoom { position: static; margin-left: auto; flex: 0 0 auto; width: 22px; height: 22px; padding: 0; border: 1.5px solid var(--ink-3); border-radius: 2px; background: transparent; display: grid; place-items: center; color: var(--ink-3); font: 16px/1 var(--sans); cursor: pointer; }

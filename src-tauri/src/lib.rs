@@ -328,13 +328,13 @@ fn sticky_day(date: Option<&str>) -> Result<chrono::NaiveDate, CmdError> {
 }
 
 #[tauri::command]
-fn list_stickies(notebook_id: String, date: Option<String>, state: tauri::State<StoreState>) -> Result<store::StickiesDto, CmdError> {
-    state.list_stickies(&notebook_id, sticky_day(date.as_deref())?)
+fn list_stickies(notebook_id: String, state: tauri::State<StoreState>) -> Result<store::StickiesDto, CmdError> {
+    state.list_stickies(&notebook_id)
 }
 
 #[tauri::command]
-fn add_sticky(notebook_id: String, date: Option<String>, content: String, state: tauri::State<StoreState>) -> Result<store::StickyCreatedDto, CmdError> {
-    state.add_sticky(&notebook_id, sticky_day(date.as_deref())?, &content)
+fn add_sticky(notebook_id: String, content: String, state: tauri::State<StoreState>) -> Result<store::StickyCreatedDto, CmdError> {
+    state.add_sticky(&notebook_id, &content)
 }
 
 #[tauri::command]
