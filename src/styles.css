@@ -557,7 +557,7 @@ button:focus-visible, input:focus-visible, summary:focus-visible, [tabindex]:foc
 }
 .ctx-item:hover { background: rgba(22, 24, 26, 0.07); }
 
-/* ============ 页脚：同步状态 + 笔记本 + 外观 ============ */
+/* ============ 页脚：同步状态 + 笔记本 + 速记 + 更新 + 外观 ============ */
 .foot {
   width: 100%;
   border: 0;
@@ -599,7 +599,39 @@ html::-webkit-scrollbar { width: 0; height: 0; }
 
 /* 外观选择在正常文档流中展开，随窗口量高，无浮层遮挡清单。 */
 .footer-area { position: relative; }
-.footer-area .foot { padding-right: 190px; min-height: 30px; }
+.footer-area .foot { padding-right: 130px; min-height: 30px; }
+#update-toggle {
+  position: absolute; right: 33px; bottom: 3px;
+  display: grid; grid-template-columns: minmax(0, 1fr) 12px; align-items: center; gap: 4px;
+  width: 96px; height: 24px; padding: 0 4px; border: 0; border-radius: 3px;
+  background: transparent; color: var(--ink-3); font: 10px var(--mono); cursor: pointer;
+}
+#update-toggle:hover, #update-toggle[aria-expanded="true"] { color: var(--ink); background: var(--wash); }
+#app-version, #update-brief { grid-area: 1 / 1; min-width: 0; white-space: nowrap; }
+#update-brief { overflow: hidden; text-overflow: ellipsis; }
+/* 短状态复用版本槽；版本文本始终留在 DOM 和可访问名称中。 */
+#update-toggle[data-state]:not([data-state="idle"]) #app-version { opacity: 0; }
+#update-toggle[data-state="ready"] #update-brief { color: var(--ink-2); }
+#update-toggle:is([data-state="error"], [data-state="no_token"]) #update-brief { color: var(--accent); }
+#update-toggle svg { grid-area: 1 / 2; transition: transform 140ms ease; }
+#update-toggle[aria-expanded="true"] svg { transform: rotate(180deg); }
+#update-panel {
+  position: absolute; bottom: 100%; right: 33px; z-index: 25;
+  width: min(180px, calc(100% - 43px)); max-height: min(240px, calc(100dvh - 60px));
+  overflow-y: auto; padding: 8px; border: 1px solid var(--hairline); border-radius: 4px;
+  background: var(--panel); color: var(--ink-2); font-size: 10px; line-height: 1.5;
+}
+.update-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.update-info { min-width: 0; }
+#update-title { margin: 0; }
+#update-current { font-family: var(--mono); }
+#update-status { margin: 2px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+/* inline-flex + line-height:1 让按钮文字按几何盒居中，不受雅黑行盒 ascent 影响（WebView2）。 */
+#update-check { display: inline-flex; align-items: center; flex: none; line-height: 1; padding: 4px 8px; border: 1px solid var(--hairline); background: transparent; color: var(--ink); font: inherit; cursor: pointer; white-space: nowrap; }
+#update-check:hover:not(:disabled) { background: var(--wash); }
+#update-check:disabled { opacity: .5; cursor: wait; }
+#update-panel label { display: block; margin-top: 6px; }
+#update-pat { width: 100%; min-width: 0; margin-top: 3px; padding: 4px 6px; border: 1px solid var(--hairline); background: var(--wash); color: var(--ink); font: inherit; }
 .appearance { background: var(--panel); }
 .appearance summary { position: absolute; right: 5px; bottom: 3px; display: grid; place-items: center; width: 24px; height: 24px; color: var(--ink-3); cursor: pointer; list-style: none; border-radius: 3px; }
 .appearance summary::-webkit-details-marker { display: none; }
@@ -607,7 +639,6 @@ html::-webkit-scrollbar { width: 0; height: 0; }
 .theme-panel { border-top: 1px solid var(--hairline); }
 .theme-heading { padding: 9px 12px 7px; color: var(--ink-2); font-size: 11px; }
 #theme-name { float: right; font-weight: 600; }
-.version-row { padding: 0 12px 8px; color: var(--ink-2); font-size: 10px; }
 .theme-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; padding: 2px 12px 6px; }
 /* v0.8 字号五档（12–16px）：A− / 当前档 / A⁺，边界档禁用对应按钮。 */
 .fontsize-row { display: flex; align-items: center; gap: 8px; padding: 4px 12px 8px; }
@@ -653,7 +684,7 @@ html[data-theme="glass"], html[data-theme="glass"] body { background: transparen
    名单含触屏 @media (hover:none) 形态的悬浮面（theme-panel/add-fab/add-open/
    pull-hint/load-retry）——Windows 触屏设备同样投放玻璃主题。
    :is() 吸收 #add-slot .add-open 的 ID 特异性，整条 (1,2,1) 压过全部基础规则。 */
-html[data-theme="glass"] :is(.undo, .ctx, #date-pick, #notebook-panel, #notes-panel,
+html[data-theme="glass"] :is(.undo, .ctx, #date-pick, #notebook-panel, #notes-panel, #update-panel,
   .theme-panel, .add-fab, #add-slot .add-open, .pull-hint, .load-retry, #board-undo) {
   background: rgba(236, 240, 246, 0.40);
   backdrop-filter: blur(10px) saturate(140%);
@@ -731,7 +762,7 @@ html[data-theme="glass"] :is(#sync-settings-form input, .notes-input:focus, .add
   #notebook-toggle { position: static; max-width: 180px; }
   #notebook-panel { position: absolute; top: 100%; right: 0; width: min(300px, 100%); box-sizing: border-box; max-height: min(360px, 65vh); overflow-y: auto; background: var(--panel); z-index: 40; cursor: auto; }
   #notebook-list { max-height: none; }
-  .footer-area .foot { padding-right: 34px; }
+  .footer-area .foot { padding-right: 130px; }
   #head-today, #notes-toggle { display: none; }
   .add, .add-open { border-top: 1px solid var(--hairline); }
   /* v0.8 桌面删除入口改右键菜单「删除这条任务」，行内 ✕ 只保留给触摸端。 */
@@ -835,25 +866,26 @@ html[data-theme="glass"] :is(#sync-settings-form input, .notes-input:focus, .add
     backdrop-filter: blur(10px) saturate(140%);
   }
   .footer-area .foot {
-    width: calc(100% - 204px - env(safe-area-inset-right, 0px));
+    width: calc(100% - 228px - env(safe-area-inset-right, 0px));
     height: 50px;
     min-height: 44px;
-    margin-right: calc(204px + env(safe-area-inset-right, 0px));
+    margin-right: calc(228px + env(safe-area-inset-right, 0px));
     padding: 0 8px 0 max(12px, env(safe-area-inset-left, 0px));
     border-top: 0;
     overflow: hidden;
   }
-  .appearance summary, #notebook-toggle, #notes-toggle {
+  .appearance summary, #notebook-toggle, #notes-toggle, #update-toggle {
     min-width: 44px;
     height: 44px;
     bottom: calc(3px + env(safe-area-inset-bottom, 0px));
   }
-  .appearance summary { width: 44px; right: calc(160px + env(safe-area-inset-right, 0px)); }
-  #notes-toggle { width:44px; right:calc(116px + env(safe-area-inset-right, 0px)); }
+  .appearance summary { width: 44px; right: calc(8px + env(safe-area-inset-right, 0px)); }
+  #update-toggle { width: 76px; right: calc(52px + env(safe-area-inset-right, 0px)); }
+  #notes-toggle { width:44px; right:calc(128px + env(safe-area-inset-right, 0px)); }
   #notes-close { min-width:44px; min-height:44px; }
   .notes-input { min-height:88px; }
-  #notebook-toggle { position: fixed; z-index: 31; right: max(8px, env(safe-area-inset-right, 0px)); }
-  .theme-panel, #notebook-panel, #notes-panel {
+  #notebook-toggle { position: fixed; z-index: 31; width: 44px; max-width: 44px; right: calc(172px + env(safe-area-inset-right, 0px)); }
+  .theme-panel, #notebook-panel, #notes-panel, #update-panel {
     position: absolute;
     bottom: 100%;
     left: 0;
@@ -862,6 +894,7 @@ html[data-theme="glass"] :is(#sync-settings-form input, .notes-input:focus, .add
     overflow-y: auto;
     background: var(--panel);
   }
+  #update-panel { width: auto; }
   #notebook-panel { position: fixed; bottom: var(--touch-bar-height); z-index: 31; }
   .add-fab, #add-slot .add-open {
     position: fixed;

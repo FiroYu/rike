@@ -2,7 +2,7 @@
 
 **English**: rike is a Windows desktop sticky to-do widget — day/week linked views, automatic rollover of unfinished tasks, future-date scheduling, a pomodoro timer per task, an embedded sticky board with a zoomable A4 note editor, edge auto-hide, in-app self-update, and multi-PC sync through your own Git repository. Built with Tauri 2 + Rust + TypeScript. No backend, no accounts: your tasks live as plain markdown files in a repo you own.
 
-Windows 桌面常驻待办贴纸：小窗口贴在桌面一角，日 / 周视图联动，未完成任务跨日自动流转，任务级番茄钟计时，多台电脑通过你自己的 Git 仓库同步。当前版本 **0.10.1**。
+Windows 桌面常驻待办贴纸：小窗口贴在桌面一角，日 / 周视图联动，未完成任务跨日自动流转，任务级番茄钟计时，多台电脑通过你自己的 Git 仓库同步。当前版本 **0.10.2**。
 
 ![界面预览](docs/app-screenshot-0.10.0.png)
 
@@ -44,6 +44,7 @@ Windows 桌面常驻待办贴纸：小窗口贴在桌面一角，日 / 周视图
 - **0.9.7** 计时模块改为番茄钟：25 分钟一段、开始后不可暂停；任务行右侧三件套（累计数 + 莫兰迪陶土色番茄图标 + MM:SS），开始过才显示；多任务并行计时，窗口隐藏仍结算；旧秒表数据自动折算并入。同步按增量合并双端番茄数；修复双机同日各自新建日 / 周文件时对端任务被错挂备注段、导致次日不流转的问题。
 - **0.10.0** 吸边自动隐藏 + 应用内自动更新：主面板贴左 / 右屏幕边缘自动滑出只留细边，鼠标移近唤出、移开再隐（`STICKY_EDGE_HIDE=0` 可关）；每次启动自动检查本仓库 Releases，下载校验后换入重启，全程失败不砖机。
 - **0.10.1** 便签板向真实便签对齐：① 便签永续——便签板改为当前笔记本**全部日期合并**展示，不再随任务区浏览日变动，贴上后一直在板上，撕掉（删除，3 秒撤销照旧）才消失；旧数据零迁移直接兼容。② 手写体日期——每张便签右下角显示创建日期（如 `2026.10.12`，由便签 ID 派生），替代原 HH:MM 时间显示；内联编辑器与 A4 放大纸面同步显示。
+- **0.10.2** 版本与更新融入底栏：外观面板回归纯主题 + 字号；版本号与更新短状态（检查中 / 下载中 / 待重启 / 更新失败）同格叠放在底部状态栏，点开小面板显示完整状态、手动「检查更新」与更新令牌输入；Esc 或点击面板外关闭；触屏窄窗走右列 44px 按钮布局。
 
 ## 安装（Windows 10/11）
 
@@ -51,7 +52,7 @@ Windows 桌面常驻待办贴纸：小窗口贴在桌面一角，日 / 周视图
 
 | 文件 | 说明 |
 | --- | --- |
-| `rike-0.10.1-x64-setup.exe` | NSIS 安装包（推荐） |
+| `rike-0.10.2-x64-setup.exe` | NSIS 安装包（推荐） |
 | `app.exe` | 便携版，下载后直接运行（自动更新也使用该文件） |
 
 0.10.0 起支持应用内自动更新：升级到本版本后，后续新版本由应用启动时自动检查并完成升级（`app.exe.sha256` 为更新校验文件）。

@@ -535,6 +535,8 @@ const notebookForm = root.querySelector<HTMLFormElement>("#notebook-form")!;
 const notebookName = root.querySelector<HTMLInputElement>("#notebook-name")!;
 const notebookError = root.querySelector<HTMLElement>("#notebook-error")!;
 const appearance = root.querySelector<HTMLDetailsElement>("#appearance")!;
+const updateToggle = root.querySelector<HTMLButtonElement>("#update-toggle")!;
+const updatePanel = root.querySelector<HTMLElement>("#update-panel")!;
 let renaming: Notebook | null = null;
 let notebookSaving = false;
 
@@ -1028,10 +1030,34 @@ function closeNotes(restoreFocus = true): void {
   if (restoreFocus) notesToggle.focus();
 }
 
+function closeUpdate(restoreFocus = true): void {
+  updatePanel.hidden = true;
+  updateToggle.setAttribute("aria-expanded", "false");
+  if (restoreFocus) updateToggle.focus();
+}
+
+updateToggle.addEventListener("click", () => {
+  if (!updatePanel.hidden) { closeUpdate(); return; }
+  if (!canNavigate() || notebookSaving) return;
+  closeNotes(false);
+  closeNotebooks(false);
+  appearance.open = false;
+  updatePanel.hidden = false;
+  updateToggle.setAttribute("aria-expanded", "true");
+  updatePanel.focus();
+});
+window.addEventListener("click", ev => {
+  const target = ev.target as Node;
+  if (!updatePanel.hidden && !updatePanel.contains(target) && !updateToggle.contains(target)) {
+    closeUpdate();
+  }
+}, true);
+
 notesToggle.addEventListener("click", () => {
   if (!notesPanel.hidden) { closeNotes(); return; }
   // A failed save remains in the hidden panel and must survive reopening.
   if (!canNavigate() || notebookSaving) return;
+  closeUpdate(false);
   closeNotebooks(false);
   appearance.open = false;
   notesPanel.hidden = false;
@@ -1190,6 +1216,7 @@ function renderNotebooks(): void {
 notebookToggle.addEventListener("click", () => {
   if (!canNavigate() || notebookSaving) return;
   if (!notebookPanel.hidden) { closeNotebooks(); return; }
+  closeUpdate(false);
   appearance.open = false;
   notebookPanel.hidden = false;
   notebookToggle.setAttribute("aria-expanded", "true");
@@ -1206,6 +1233,7 @@ window.addEventListener("click", ev => {
 }, true);
 
 appearance.addEventListener("toggle", () => {
+  if (appearance.open) closeUpdate(false);
   if (appearance.open && !notebookPanel.hidden) {
     if (notebookSaving) appearance.open = false;
     else closeNotebooks(false);
@@ -1730,6 +1758,11 @@ for (const evName of TOUCH_DEVICE ? [] : ["pointerdown", "keydown", "pointermove
 window.addEventListener("keydown", (ev) => {
   if (ev.isComposing || ev.keyCode === 229) return;
   if (ev.key !== "Escape") return;
+  if (!updatePanel.hidden) {
+    ev.preventDefault();
+    closeUpdate();
+    return;
+  }
   if (!notesPanel.hidden) {
     ev.preventDefault();
     closeNotes();
@@ -1813,6 +1846,7 @@ if (TOUCH_DEVICE) {
   // Reconcile one history entry at a time: back() is asynchronous, and panels
   // can reopen or replace one another before its popstate arrives.
   const panels = [
+    { node: updatePanel, open: () => !updatePanel.hidden, close: () => closeUpdate() },
     { node: notesPanel, open: () => !notesPanel.hidden, close: () => closeNotes() },
     { node: notebookPanel, open: () => !notebookPanel.hidden, close: () => closeNotebooks() },
     { node: notebookForm, open: () => !notebookPanel.hidden && !notebookForm.hidden,

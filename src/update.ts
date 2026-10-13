@@ -3,6 +3,9 @@ import { listen } from "@tauri-apps/api/event";
 import { api, type UpdateStatus } from "./api";
 
 const version = document.querySelector<HTMLElement>("#app-version")!;
+const current = document.querySelector<HTMLElement>("#update-current")!;
+const toggle = document.querySelector<HTMLButtonElement>("#update-toggle")!;
+const brief = document.querySelector<HTMLElement>("#update-brief")!;
 const status = document.querySelector<HTMLElement>("#update-status")!;
 const check = document.querySelector<HTMLButtonElement>("#update-check")!;
 const pat = document.querySelector<HTMLInputElement>("#update-pat")!;
@@ -18,8 +21,25 @@ const labels: Record<UpdateStatus["state"], string> = {
   no_token: "需要 GitHub 令牌",
 };
 
+const briefLabels: Record<UpdateStatus["state"], string> = {
+  idle: "",
+  checking: "检查中…",
+  downloading: "下载中…",
+  ready: "待重启",
+  updated: "重启中…",
+  error: "更新失败 !",
+  no_token: "需令牌 !",
+};
+
+function renderBrief(state: UpdateStatus["state"]): void {
+  brief.textContent = briefLabels[state];
+  toggle.dataset.state = state;
+}
+
 function render(value: UpdateStatus): void {
   version.textContent = value.current;
+  current.textContent = value.current;
+  renderBrief(value.state);
   status.textContent = value.message || labels[value.state];
   status.title = value.latest ? `最新版本 ${value.latest}` : "";
   const needsToken = value.state === "no_token";
@@ -39,6 +59,7 @@ check.addEventListener("click", async () => {
     await api.updateCheckNow();
   } catch (error) {
     status.textContent = error instanceof Error ? error.message : "无法检查更新";
+    renderBrief("error");
     check.disabled = false;
   }
 });
@@ -46,5 +67,6 @@ check.addEventListener("click", async () => {
 void listen<UpdateStatus>("update-status", event => render(event.payload));
 void api.updateStatus().then(render).catch(() => {
   status.textContent = "状态不可用";
+  renderBrief("error");
   check.hidden = false;
 });

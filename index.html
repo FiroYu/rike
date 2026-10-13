@@ -89,10 +89,6 @@
               <span id="font-size-label" aria-live="polite">13</span>
               <button id="font-up" type="button" title="放大字号" aria-label="放大字号">A⁺</button>
             </div>
-            <p class="version-row">版本 <span id="app-version">—</span> · <span id="update-status" role="status">…</span></p>
-            <button id="update-check" type="button" hidden>检查更新</button>
-            <label for="update-pat" hidden>更新令牌</label>
-            <input id="update-pat" type="password" placeholder="GitHub PAT（未配置 Git 凭据时填）" autocomplete="new-password" hidden>
             <p id="theme-status" role="status">仅保存在这台设备</p>
           </div>
         </details>
@@ -103,6 +99,23 @@
         </span>
         <span id="sync-tag" hidden>sticky</span>
         </button>
+        <button id="update-toggle" type="button" aria-expanded="false" aria-controls="update-panel" title="版本与更新">
+          <span id="app-version">—</span><span id="update-brief" aria-live="polite"></span>
+          <svg width="12" height="12" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+            <path d="m5 12 5-5 5 5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </button>
+        <div id="update-panel" hidden aria-labelledby="update-title" tabindex="-1">
+          <div class="update-row">
+            <div class="update-info">
+              <p id="update-title">版本 <span id="update-current">—</span></p>
+              <p id="update-status" role="status">…</p>
+            </div>
+            <button id="update-check" type="button" hidden>检查更新</button>
+          </div>
+          <label for="update-pat" hidden>更新令牌</label>
+          <input id="update-pat" type="password" placeholder="GitHub PAT" autocomplete="new-password" hidden>
+        </div>
       </div>
       <div id="board-mask" hidden><div class="board-editor" role="dialog" aria-label="编辑便签">
         <div class="board-editor-head" data-tauri-drag-region>
