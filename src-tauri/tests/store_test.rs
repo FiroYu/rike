@@ -319,10 +319,11 @@ fn scheduler_stop_flushes_pending_edit() {
     let sched = sched::spawn_with_repo_url(store.clone(), fast_timing(), emit, url);
 
     let day = FileKind::Day(d("2026-09-10"));
-    assert!(wait_until(Duration::from_secs(3), || store.get_view("default", day).is_ok()));
+    // CI 慢机器上 git 初始化可远超 3s；wait_until 条件满足即返回，放宽只影响失败路径。
+    assert!(wait_until(Duration::from_secs(15), || store.get_view("default", day).is_ok()));
     store.add_task("default", &day, Category::Personal, Priority::P2, "退出前任务", &[], 0).unwrap();
     // 不等 tick，直接退出 flush
-    assert!(sched.stop(Duration::from_secs(5)), "flush 应在超时前完成");
+    assert!(sched.stop(Duration::from_secs(20)), "flush 应在超时前完成");
     assert_eq!(store.engine().unpushed_count().unwrap(), 0, "退出时无积压");
     let last_msg = git(&a, &["log", "-1", "--format=%s"]);
     assert!(last_msg.starts_with("sticky@"), "commit 前缀: {last_msg}");
@@ -370,12 +371,12 @@ fn scheduler_tick_silent_pulls_remote_changes() {
     // 启动即同步（M3：隔夜远端变更不等 tick）：等它完成（syncing→idle），
     // 之后的计数才归 tick 静默 pull——启动窗口的 syncing 是预期行为，不算噪音。
     assert!(
-        wait_until(Duration::from_secs(3), || ev
+        wait_until(Duration::from_secs(15), || ev
             .lock()
             .unwrap()
             .iter()
             .any(|(e, p)| e == "sync-status" && p.contains("\"idle\""))),
-        "3s 内启动同步应完成"
+        "启动同步应在预算内完成"
     );
     let start = ev.lock().unwrap().len();
 
@@ -392,8 +393,8 @@ fn scheduler_tick_silent_pulls_remote_changes() {
 
     // tick 静默 pull：文件落地到 a
     assert!(
-        wait_until(Duration::from_secs(3), || a.join("days/2026-09-09.md").exists()),
-        "3s 内应静默拉到远端变更"
+        wait_until(Duration::from_secs(15), || a.join("days/2026-09-09.md").exists()),
+        "预算内应静默拉到远端变更"
     );
     // tick 静默 pull 不进入 Syncing（不打扰）；从启动同步完成后起算
     let synced = ev
