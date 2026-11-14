@@ -54,6 +54,47 @@ pub fn commit_prefix() -> String {
     format!("sticky@{}:", machine_tag())
 }
 
+/// 心跳总开关：`STICKY_HEARTBEAT=0` 关闭（照 `STICKY_AUTO_MERGE` 先例）。
+fn heartbeat_enabled() -> bool {
+    std::env::var("STICKY_HEARTBEAT").map(|v| v != "0").unwrap_or(true)
+}
+
+/// machine tag 净化为心跳文件名安全段：保留 `[a-z0-9_-]`，其余折叠为 `-`，
+/// 空结果回退 `unknown`，截 40 字符。tag 来自环境/文件/主机名，不能直接当文件名用。
+fn heartbeat_file_tag(tag: &str) -> String {
+    let mut out = String::new();
+    for c in tag.to_lowercase().chars() {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-' {
+            out.push(c);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        return "unknown".to_owned();
+    }
+    trimmed.chars().take(40).collect()
+}
+
+/// 心跳是否过期：文件缺失/损坏、版本不一致或 lastSeen 非今日 → 需要更新。
+fn heartbeat_is_stale(content: Option<&str>, version: &str, today: chrono::NaiveDate) -> bool {
+    let Some(content) = content else {
+        return true;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return true;
+    };
+    if value.get("version").and_then(|v| v.as_str()) != Some(version) {
+        return true;
+    }
+    let prefix = today.format("%Y-%m-%d").to_string();
+    match value.get("lastSeen").and_then(|v| v.as_str()) {
+        Some(seen) => !seen.starts_with(&prefix),
+        None => true,
+    }
+}
+
 /// 一次同步周期的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncStatus {
@@ -285,6 +326,37 @@ impl SyncEngine {
             self.push_staged(io)?;
         }
         Ok(auto_merged)
+    }
+
+    /// 同步仓库根 `.machines/<tag>.json` 心跳：文件缺失、版本不同或 lastSeen
+    /// 非今日时写入并走既有提交流程（每机每日 ≤1 条额外提交；每机独立文件，
+    /// tag 经 `heartbeat_file_tag` 净化后唯一，git 合并天然不相交）。
+    /// 返回是否写入。提交失败时文件留在工作区，由下一轮同步顺带推走。
+    pub fn heartbeat_if_stale(&self, io: &std::sync::Mutex<()>) -> Result<bool, SyncError> {
+        if !heartbeat_enabled() {
+            return Ok(false);
+        }
+        let tag = heartbeat_file_tag(&machine_tag());
+        let dir = self.repo_dir.join(".machines");
+        let path = dir.join(format!("{tag}.json"));
+        let existing = std::fs::read_to_string(&path).ok();
+        let today = chrono::Local::now().date_naive();
+        if !heartbeat_is_stale(existing.as_deref(), env!("CARGO_PKG_VERSION"), today) {
+            return Ok(false);
+        }
+        let payload = serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "lastSeen": chrono::Local::now().format("%Y-%m-%dT%H:%M").to_string(),
+            "os": std::env::consts::OS,
+        });
+        let body = serde_json::to_string_pretty(&payload)
+            .map(|pretty| format!("{pretty}\n"))
+            .map_err(|error| SyncError::Git(error.to_string()))?;
+        std::fs::create_dir_all(&dir).map_err(|error| SyncError::Git(error.to_string()))?;
+        std::fs::write(&path, body).map_err(|error| SyncError::Git(error.to_string()))?;
+        let message = format!("{} 心跳 v{}", commit_prefix(), env!("CARGO_PKG_VERSION"));
+        self.sync_cycle_staged(&message, io)?;
+        Ok(true)
     }
 
     fn push_staged(&self, io: &std::sync::Mutex<()>) -> Result<bool, SyncError> {
@@ -1770,5 +1842,49 @@ mod tests {
         run_git(Some(&a), &["config", &format!("branch.{branch}.remote"), "other"]).unwrap();
         assert!(eng.ensure_cloned(&url).is_err(), "a branch tracking another remote must fail startup validation");
         assert!(eng.pull().is_err());
+    }
+
+    #[test]
+    fn heartbeat_file_tag_is_a_safe_path_segment() {
+        assert_eq!(heartbeat_file_tag("tablet"), "tablet");
+        assert_eq!(heartbeat_file_tag("WIN-DEMO-PC"), "win-demo-pc");
+        assert_eq!(heartbeat_file_tag("a..b//c"), "a-b-c");
+        assert_eq!(heartbeat_file_tag("机器 房间"), "unknown");
+        assert_eq!(heartbeat_file_tag(""), "unknown");
+        assert_eq!(heartbeat_file_tag("--__--"), "__");
+        assert_eq!(heartbeat_file_tag(&"x".repeat(80)).chars().count(), 40);
+    }
+
+    #[test]
+    fn heartbeat_staleness_follows_version_and_date() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 26).unwrap();
+        let fresh = r#"{"version":"0.10.3","lastSeen":"2026-10-26T12:34","os":"windows"}"#;
+        let old_day = r#"{"version":"0.10.3","lastSeen":"2026-10-25T23:59","os":"windows"}"#;
+        let old_version = r#"{"version":"0.10.2","lastSeen":"2026-10-26T12:34","os":"windows"}"#;
+        assert!(!heartbeat_is_stale(Some(fresh), "0.10.3", today));
+        assert!(heartbeat_is_stale(None, "0.10.3", today));
+        assert!(heartbeat_is_stale(Some(old_day), "0.10.3", today));
+        assert!(heartbeat_is_stale(Some(old_version), "0.10.3", today));
+        assert!(heartbeat_is_stale(Some("not json"), "0.10.3", today));
+        assert!(heartbeat_is_stale(Some(r#"{"version":"0.10.3"}"#), "0.10.3", today));
+    }
+
+    #[test]
+    fn heartbeat_writes_and_commits_once_per_version_day() {
+        let (a, _b, url) = setup_two_party("heartbeat");
+        let eng = SyncEngine::new(&a);
+        eng.ensure_cloned(&url).unwrap();
+        let io = std::sync::Mutex::new(());
+        let tag = heartbeat_file_tag(&machine_tag());
+        let path = eng.repo_dir().join(".machines").join(format!("{tag}.json"));
+
+        assert!(eng.heartbeat_if_stale(&io).unwrap());
+        assert!(path.exists());
+        let first = std::fs::read_to_string(&path).unwrap();
+        assert!(first.contains(&format!("\"version\": \"{}\"", env!("CARGO_PKG_VERSION"))));
+
+        // 同日同版本：不再写（每机每日 ≤1 条心跳提交）。
+        assert!(!eng.heartbeat_if_stale(&io).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
     }
 }

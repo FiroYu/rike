@@ -612,6 +612,8 @@ html::-webkit-scrollbar { width: 0; height: 0; }
 /* 短状态复用版本槽；版本文本始终留在 DOM 和可访问名称中。 */
 #update-toggle[data-state]:not([data-state="idle"]) #app-version { opacity: 0; }
 #update-toggle[data-state="ready"] #update-brief { color: var(--ink-2); }
+/* retry_wait 是自动重试的中性等待态，不走红；红只留给 error 与 no_token。 */
+#update-toggle[data-state="retry_wait"] #update-brief { color: var(--ink-2); }
 #update-toggle:is([data-state="error"], [data-state="no_token"]) #update-brief { color: var(--accent); }
 #update-toggle svg { grid-area: 1 / 2; transition: transform 140ms ease; }
 #update-toggle[aria-expanded="true"] svg { transform: rotate(180deg); }

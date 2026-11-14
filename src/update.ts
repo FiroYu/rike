@@ -19,6 +19,7 @@ const labels: Record<UpdateStatus["state"], string> = {
   updated: "正在重启…",
   error: "更新失败",
   no_token: "需要 GitHub 令牌",
+  retry_wait: "网络未就绪",
 };
 
 const briefLabels: Record<UpdateStatus["state"], string> = {
@@ -29,6 +30,7 @@ const briefLabels: Record<UpdateStatus["state"], string> = {
   updated: "重启中…",
   error: "更新失败 !",
   no_token: "需令牌 !",
+  retry_wait: "稍后重试",
 };
 
 function renderBrief(state: UpdateStatus["state"]): void {
@@ -40,8 +42,16 @@ function render(value: UpdateStatus): void {
   version.textContent = value.current;
   current.textContent = value.current;
   renderBrief(value.state);
-  status.textContent = value.message || labels[value.state];
-  status.title = value.latest ? `最新版本 ${value.latest}` : "";
+  let line = value.message || labels[value.state];
+  if (value.state === "idle" && value.last_check) {
+    line = `已是最新版（上次检查 ${value.last_check}）`;
+  }
+  status.textContent = line;
+  const titleParts: string[] = [];
+  if (value.latest) titleParts.push(`最新版本 ${value.latest}`);
+  if (value.detail) titleParts.push(value.detail);
+  status.title = titleParts.join("\n");
+  // 令牌输入：仅完全缺失令牌时出现；公开仓匿名流程不因 404 引导填令牌。
   const needsToken = value.state === "no_token";
   pat.hidden = !needsToken;
   patLabel.hidden = !needsToken;

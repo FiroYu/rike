@@ -327,12 +327,14 @@ fn full_sync(store: &Arc<StickyStore>, timing: &SchedTiming, retry_at: &mut Opti
             store.set_status(SyncUiState::Merged { files: auto_merged });
             #[cfg(windows)]
             rollover_rescan(store, emit);
+            heartbeat(store);
         }
         Ok(_) => {
             *retry_at = None;
             store.set_status(SyncUiState::Idle);
             #[cfg(windows)]
             rollover_rescan(store, emit);
+            heartbeat(store);
         }
         Err(SyncError::Conflict(m)) => {
             // 真冲突：本地提交保留，等人工处理（重试按钮 / 打开仓库文件夹）
@@ -359,6 +361,14 @@ fn full_sync(store: &Arc<StickyStore>, timing: &SchedTiming, retry_at: &mut Opti
     }
 }
 
+/// 同步成功后的心跳（尽力而为）：向同步仓库报告本机版本，失败只记日志，
+/// 不动同步 UI 状态（心跳不是用户动作）。
+fn heartbeat(store: &Arc<StickyStore>) {
+    if let Err(e) = store.engine().heartbeat_if_stale(store.io_mutex()) {
+        log_err!("[sched] 心跳失败（下轮同步重试）: {}", sync_error_message(&e));
+    }
+}
+
 fn silent_pull(store: &Arc<StickyStore>, retry_at: &mut Option<Instant>, emit: &EmitFn) {
     let before = store.watched_fingerprints(today());
     let result = store.engine().pull_staged(store.io_mutex());
@@ -370,6 +380,7 @@ fn silent_pull(store: &Arc<StickyStore>, retry_at: &mut Option<Instant>, emit: &
             }
             #[cfg(windows)]
             rollover_rescan(store, emit);
+            heartbeat(store);
         }
         Err(SyncError::Conflict(m)) => {
             *retry_at = None;

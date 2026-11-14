@@ -88,8 +88,16 @@ export type SyncState =
 export interface UpdateStatus {
   current: string;
   latest: string | null;
-  state: "idle" | "checking" | "downloading" | "ready" | "updated" | "error" | "no_token";
+  state: "idle" | "checking" | "downloading" | "ready" | "updated" | "error" | "no_token" | "retry_wait";
   message: string | null;
+  /** 上次检查时刻（HH:MM），任何状态都随状态携带。 */
+  last_check: string | null;
+  /** retry_wait 态的自动重试时刻（HH:MM）。 */
+  next_retry: string | null;
+  /** 失败分类：retryable | rate_limited | auth_missing | auth_invalid | fatal。 */
+  failure_class: string | null;
+  /** 原始错误（已脱敏），面板 title 呈现。 */
+  detail: string | null;
 }
 
 export class ApiError extends Error {

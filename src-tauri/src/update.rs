@@ -5,7 +5,12 @@
 //! 任何 Tauri builder 和单实例插件之前等待旧进程，否则新进程可能被旧实例的聚焦回调吞掉。
 //! release 使用 `panic=abort`，因此更新的网络、文件、进程与锁路径均以 `Result` 或容错分支收口，
 //! 失败只更新状态并保留可启动的旧程序。
+//!
+//! v0.10.3 起：常驻循环（首查 +3s，瞬态失败退避 30s→2m→10m→30m，其余 1h 复查）、
+//! 代理瞬断后直连回退一次（两种客户端仅代理配置不同）、错误分类（瞬态走中性
+//! `retry_wait`，鉴权/结构类走红色 `error`），每次尝试追加 `%APPDATA%\sticky-todo\update.log`。
 
+use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::windows::ffi::OsStrExt;
@@ -16,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
+use chrono::{Local, SecondsFormat};
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{ACCEPT, AUTHORIZATION, LOCATION, USER_AGENT};
 use serde::{Deserialize, Serialize};
@@ -35,6 +41,136 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 const SYNCHRONIZE: u32 = 0x0010_0000;
 const WAIT_FAILED: u32 = 0xffff_ffff;
+/// 成功或非瞬态失败后的复查周期（顺带覆盖长运行机器的新版本发现）。
+const RECHECK: Duration = Duration::from_secs(3600);
+/// 自动检查瞬态失败的退避节奏；索引越界封顶在末档。
+const BACKOFF_STEPS: [Duration; 4] = [
+    Duration::from_secs(30),
+    Duration::from_secs(120),
+    Duration::from_secs(600),
+    Duration::from_secs(1800),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureKind {
+    /// 网络/超时/5xx：退避自动重试，中性 UI。
+    Retryable,
+    /// GitHub 限流：按瞬态重试，文案单独标注。
+    RateLimited,
+    /// 404：最新版本接口不可达（公共仓无 release、资产缺失等）。
+    AuthMissing,
+    /// 401：令牌无效。
+    AuthInvalid,
+    /// 校验/换入/协议类结构问题：红色完整错误。
+    Fatal,
+}
+
+impl FailureKind {
+    fn is_retryable(self) -> bool {
+        matches!(self, FailureKind::Retryable | FailureKind::RateLimited)
+    }
+
+    /// 面板主行的中文分类文案。
+    fn label(self) -> &'static str {
+        match self {
+            FailureKind::Retryable => "网络或代理未就绪",
+            FailureKind::RateLimited => "GitHub 限流",
+            FailureKind::AuthMissing => "仓库无可用版本",
+            FailureKind::AuthInvalid => "令牌无效",
+            FailureKind::Fatal => "更新失败",
+        }
+    }
+
+    /// 进状态与日志的分类标识。
+    fn class(self) -> &'static str {
+        match self {
+            FailureKind::Retryable => "retryable",
+            FailureKind::RateLimited => "rate_limited",
+            FailureKind::AuthMissing => "auth_missing",
+            FailureKind::AuthInvalid => "auth_invalid",
+            FailureKind::Fatal => "fatal",
+        }
+    }
+}
+
+/// 检查/下载/换入任一环节的失败。`transport` = 请求发送层失败（代理瞬态类），
+/// 是直连回退的唯一触发条件；HTTP 状态类与 body 类失败不回退。
+#[derive(Debug, Clone)]
+struct CheckError {
+    kind: FailureKind,
+    transport: bool,
+    message: String,
+}
+
+impl CheckError {
+    fn fatal(message: impl Into<String>) -> Self {
+        Self {
+            kind: FailureKind::Fatal,
+            transport: false,
+            message: message.into(),
+        }
+    }
+
+    fn with_kind(kind: FailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            transport: false,
+            message: message.into(),
+        }
+    }
+
+    fn transport(message: impl Into<String>) -> Self {
+        Self {
+            kind: FailureKind::Retryable,
+            transport: true,
+            message: message.into(),
+        }
+    }
+
+    /// 响应体读取/解析失败：多为截断类瞬态，自动重试，原始错误进日志。
+    fn body(message: impl Into<String>) -> Self {
+        Self {
+            kind: FailureKind::Retryable,
+            transport: false,
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for CheckError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<String> for CheckError {
+    fn from(message: String) -> Self {
+        Self::fatal(message)
+    }
+}
+
+fn rate_limited(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())
+        == Some("0")
+        || headers.get("retry-after").is_some()
+}
+
+fn classify_status(status: reqwest::StatusCode, limited: bool) -> FailureKind {
+    match status.as_u16() {
+        401 => FailureKind::AuthInvalid,
+        404 => FailureKind::AuthMissing,
+        429 => FailureKind::RateLimited,
+        403 if limited => FailureKind::RateLimited,
+        500..=599 => FailureKind::Retryable,
+        _ => FailureKind::Fatal,
+    }
+}
+
+fn backoff_delay(step: usize) -> Duration {
+    BACKOFF_STEPS[step.min(BACKOFF_STEPS.len() - 1)]
+}
 
 #[derive(Clone, Serialize)]
 pub struct UpdateStatus {
@@ -42,6 +178,10 @@ pub struct UpdateStatus {
     latest: Option<String>,
     state: String,
     message: Option<String>,
+    last_check: Option<String>,
+    next_retry: Option<String>,
+    failure_class: Option<String>,
+    detail: Option<String>,
 }
 
 impl UpdateStatus {
@@ -51,6 +191,10 @@ impl UpdateStatus {
             latest,
             state: state.to_owned(),
             message,
+            last_check: LAST_CHECK.lock().ok().and_then(|guard| guard.clone()),
+            next_retry: None,
+            failure_class: None,
+            detail: None,
         }
     }
 }
@@ -61,7 +205,7 @@ struct Release {
     assets: Vec<Asset>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct Asset {
     name: String,
     url: String,
@@ -71,9 +215,14 @@ struct Asset {
 static STATUS: LazyLock<Mutex<UpdateStatus>> =
     LazyLock::new(|| Mutex::new(UpdateStatus::new("idle", None, None)));
 static CHECKING: AtomicBool = AtomicBool::new(false);
+static LAST_CHECK: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 
 fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+fn now_hhmm() -> String {
+    Local::now().format("%H:%M").to_string()
 }
 
 fn parse_ver(tag: &str) -> Option<(u64, u64, u64)> {
@@ -129,22 +278,28 @@ fn may_follow(hops: usize) -> bool {
     hops < MAX_REDIRECTS
 }
 
-fn client() -> Result<Client, String> {
+fn tls_config() -> Result<rustls::ClientConfig, String> {
     let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+    Ok(rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
     .with_safe_default_protocol_versions()
     .map_err(|error| error.to_string())?
     .with_root_certificates(roots)
-    .with_no_client_auth();
-    Client::builder()
-        .tls_backend_preconfigured(tls)
+    .with_no_client_auth())
+}
+
+/// 代理版与直连版唯一差异是 `no_proxy`：TLS、重定向与超时配置完全复用（审核定案）。
+fn build_client(direct: bool) -> Result<Client, String> {
+    let mut builder = Client::builder()
+        .tls_backend_preconfigured(tls_config()?)
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(20))
-        .timeout(Duration::from_secs(120))
-        .build()
-        .map_err(|error| error.to_string())
+        .timeout(Duration::from_secs(120));
+    if direct {
+        builder = builder.no_proxy();
+    }
+    builder.build().map_err(|error| error.to_string())
 }
 
 fn get_follow_with(
@@ -152,8 +307,9 @@ fn get_follow_with(
     url: &str,
     token: &str,
     asset_download: bool,
-) -> Result<Response, String> {
-    let mut target = reqwest::Url::parse(url).map_err(|error| error.to_string())?;
+) -> Result<Response, CheckError> {
+    let mut target = reqwest::Url::parse(url)
+        .map_err(|error| CheckError::fatal(error.to_string()))?;
     for hop in 0..=MAX_REDIRECTS {
         let mut request = client
             .get(target.clone())
@@ -167,32 +323,85 @@ fn get_follow_with(
         } else if auth_for(hop, host) && !token.is_empty() {
             request = request.header(AUTHORIZATION, format!("Bearer {token}"));
         }
-        let response = request.send().map_err(|error| error.to_string())?;
-        if !response.status().is_redirection() {
-            return response
-                .error_for_status()
-                .map_err(|error| error.to_string());
+        let response = request
+            .send()
+            .map_err(|error| CheckError::transport(error.to_string()))?;
+        let status = response.status();
+        if !status.is_redirection() {
+            if status.is_client_error() || status.is_server_error() {
+                let kind = classify_status(status, rate_limited(response.headers()));
+                return Err(CheckError::with_kind(kind, format!("HTTP {status}")));
+            }
+            return Ok(response);
         }
         if !may_follow(hop) {
-            return Err("重定向次数超过上限".into());
+            return Err(CheckError::fatal("重定向次数超过上限"));
         }
         let location = response
             .headers()
             .get(LOCATION)
-            .ok_or_else(|| "重定向缺少 Location".to_owned())?
+            .ok_or_else(|| CheckError::fatal("重定向缺少 Location"))?
             .to_str()
-            .map_err(|_| "重定向 Location 无效".to_owned())?;
-        target = target.join(location).map_err(|error| error.to_string())?;
+            .map_err(|_| CheckError::fatal("重定向 Location 无效"))?;
+        target = target
+            .join(location)
+            .map_err(|error| CheckError::fatal(error.to_string()))?;
     }
-    Err("重定向次数超过上限".into())
+    Err(CheckError::fatal("重定向次数超过上限"))
 }
 
-fn get_follow(client: &Client, url: &str, token: &str) -> Result<Response, String> {
-    get_follow_with(client, url, token, false)
+/// 代理优先，发送层失败后直连回退一次；两种客户端各构建一次复用整轮检查。
+struct Fetcher {
+    proxy: Client,
+    direct: Option<Client>,
+    fallback_used: bool,
 }
 
-fn get_asset(client: &Client, url: &str, token: &str) -> Result<Response, String> {
-    get_follow_with(client, url, token, true)
+impl Fetcher {
+    fn new() -> Result<Self, CheckError> {
+        Ok(Self {
+            proxy: build_client(false).map_err(CheckError::fatal)?,
+            direct: None,
+            fallback_used: false,
+        })
+    }
+
+    fn direct(&mut self) -> Result<&Client, CheckError> {
+        if self.direct.is_none() {
+            self.direct = Some(build_client(true).map_err(CheckError::fatal)?);
+        }
+        Ok(self.direct.as_ref().expect("直连客户端已就绪"))
+    }
+
+    fn get(&mut self, url: &str, token: &str, asset_download: bool) -> Result<Response, CheckError> {
+        match get_follow_with(&self.proxy, url, token, asset_download) {
+            Ok(response) => Ok(response),
+            Err(error) if error.transport => {
+                let direct = self.direct()?;
+                match get_follow_with(direct, url, token, asset_download) {
+                    Ok(response) => {
+                        self.fallback_used = true;
+                        Ok(response)
+                    }
+                    Err(second) => Err(CheckError {
+                        kind: second.kind,
+                        transport: false,
+                        message: format!("proxy: {}; direct: {}", error.message, second.message),
+                    }),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// 本次检查实际使用的传输路径（日志用）。
+    fn transport_label(&self) -> &'static str {
+        if self.fallback_used {
+            "proxy->direct"
+        } else {
+            "proxy"
+        }
+    }
 }
 
 fn credential_token() -> Option<String> {
@@ -264,17 +473,79 @@ fn set_status(app: Option<&tauri::AppHandle>, status: UpdateStatus) {
     }
 }
 
-fn read_response(response: Response, expected_size: u64) -> Result<Vec<u8>, String> {
+/// 日志路径：`STICKY_QA_ROOT` 覆盖（e2e 里该键被 qa_session 剥掉，实际走隔离
+/// APPDATA 下的生产路径）→ `%APPDATA%\sticky-todo\update.log`。
+fn update_log_path() -> Option<PathBuf> {
+    if let Ok(qa) = std::env::var("STICKY_QA_ROOT") {
+        return Some(PathBuf::from(qa).join("update.log"));
+    }
+    std::env::var("APPDATA")
+        .ok()
+        .map(|appdata| PathBuf::from(appdata).join("sticky-todo").join("update.log"))
+}
+
+/// 超过 512KB 时仅保留末 200 行（临时文件 + 原子替换）。
+fn rotate_log(path: &Path) {
+    const MAX_BYTES: u64 = 512 * 1024;
+    const KEEP_LINES: usize = 200;
+    let Ok(meta) = fs::metadata(path) else {
+        return;
+    };
+    if meta.len() <= MAX_BYTES {
+        return;
+    }
+    let Ok(content) = fs::read_to_string(path) else {
+        return;
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let keep_from = lines.len().saturating_sub(KEEP_LINES);
+    let tmp = path.with_extension("log.tmp");
+    if fs::write(&tmp, format!("{}\n", lines[keep_from..].join("\n"))).is_ok() {
+        let _ = fs::rename(&tmp, path);
+    }
+}
+
+/// 每次尝试追加一行；错误经同步侧 sanitize 脱敏（令牌/URL userinfo），令牌本身不落盘。
+fn log_attempt(transport: &str, token: Option<&str>, error: Option<&str>) {
+    let Some(path) = update_log_path() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let (state, latest) = STATUS
+        .lock()
+        .map(|guard| (guard.state.clone(), guard.latest.clone()))
+        .unwrap_or_else(|_| ("unknown".into(), None));
+    let mut line = format!(
+        "{} check current={} latest={} outcome={} transport=",
+        Local::now().to_rfc3339_opts(SecondsFormat::Secs, false),
+        current_version(),
+        latest.as_deref().unwrap_or("-"),
+        state,
+    );
+    line.push_str(transport);
+    if let Some(error) = error.filter(|error| !error.is_empty()) {
+        let sanitized = crate::sched::sanitize_sync_error(error, token);
+        line.push_str(&format!(" error=\"{sanitized}\""));
+    }
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(file, "{line}");
+    }
+    rotate_log(&path);
+}
+
+fn read_response(response: Response, expected_size: u64) -> Result<Vec<u8>, CheckError> {
     let limit = expected_size
         .checked_add(1)
-        .ok_or_else(|| "下载大小无效".to_owned())?;
+        .ok_or_else(|| CheckError::fatal("下载大小无效"))?;
     let mut bytes = Vec::new();
     response
         .take(limit)
         .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| CheckError::body(error.to_string()))?;
     if u64::try_from(bytes.len()).ok() != Some(expected_size) {
-        return Err("下载长度不匹配".into());
+        return Err(CheckError::fatal("下载长度不匹配"));
     }
     Ok(bytes)
 }
@@ -373,71 +644,164 @@ fn apply(app: &tauri::AppHandle, new: &Path, latest: &str) -> Result<(), String>
     Ok(())
 }
 
-fn check(app: tauri::AppHandle, delay: bool) {
+/// 一次检查的网络与换入主体。成功路径已在内部落好 idle/downloading/ready/updated 状态。
+fn perform(app: &tauri::AppHandle, fetcher: &mut Fetcher, token: &str) -> Result<(), CheckError> {
+    let release_text = fetcher
+        .get(&api_url(), token, false)?
+        .text()
+        .map_err(|error| CheckError::body(error.to_string()))?;
+    let release: Release =
+        serde_json::from_str(&release_text).map_err(|error| CheckError::body(error.to_string()))?;
+    if !is_newer(&release.tag_name, current_version()) {
+        set_status(
+            Some(app),
+            UpdateStatus::new("idle", Some(release.tag_name), None),
+        );
+        return Ok(());
+    }
+    let latest = release.tag_name.clone();
+    let asset = pick_asset(&release.assets)
+        .ok_or_else(|| CheckError::fatal("Release 缺少 app.exe"))?
+        .clone();
+    let checksum = release
+        .assets
+        .iter()
+        .find(|candidate| candidate.name == "app.exe.sha256")
+        .ok_or_else(|| CheckError::fatal("Release 缺少 app.exe.sha256"))?
+        .clone();
+    set_status(
+        Some(app),
+        UpdateStatus::new("downloading", Some(latest.clone()), None),
+    );
+    let bytes = read_response(fetcher.get(&asset.url, token, true)?, asset.size)
+        .map_err(|error| CheckError {
+            message: format!("app.exe {}", error.message),
+            ..error
+        })?;
+    let sha_bytes = read_response(fetcher.get(&checksum.url, token, true)?, checksum.size)
+        .map_err(|error| CheckError {
+            message: format!("app.exe.sha256 {}", error.message),
+            ..error
+        })?;
+    let sha_text = String::from_utf8(sha_bytes)
+        .map_err(|_| CheckError::fatal("SHA-256 文件不是有效 UTF-8"))?;
+    let expected = parse_sha256(&sha_text).ok_or_else(|| CheckError::fatal("SHA-256 文件格式无效"))?;
+    if !verify_sha256(&bytes, &expected) {
+        return Err(CheckError::fatal("app.exe SHA-256 校验失败"));
+    }
+    let new = write_staged(&bytes, &expected, &latest).map_err(CheckError::fatal)?;
+    set_status(
+        Some(app),
+        UpdateStatus::new("ready", Some(latest.clone()), None),
+    );
+    apply(app, &new, &latest).map_err(CheckError::fatal)
+}
+
+/// 自动检查的裁决：Transient → 调度器按退避节奏重试；Settled → 按 1h 周期复查。
+enum Verdict {
+    Settled,
+    Transient,
+}
+
+/// 单次更新检查。`backoff` 是本次瞬态失败后调度器将采用的等待时长（用于展示重试时刻）。
+/// 与其他检查共用 CHECKING 锁：锁被占时直接让位，由进行中的检查产出状态。
+fn check_once(app: &tauri::AppHandle, automatic: bool, backoff: Duration) -> Verdict {
     if CHECKING.swap(true, Ordering::SeqCst) {
-        return;
+        return Verdict::Settled;
     }
-    if delay {
-        std::thread::sleep(Duration::from_secs(3));
+    if let Ok(mut last) = LAST_CHECK.lock() {
+        *last = Some(now_hhmm());
     }
-    let result = (|| -> Result<(), String> {
-        // 公开仓匿名即可检查与下载；令牌（Git 凭据或面板 PAT）仅私有部署需要。
-        let token = token().unwrap_or_default();
-        set_status(Some(&app), UpdateStatus::new("checking", None, None));
-        let client = client()?;
-        let release_text = get_follow(&client, &api_url(), &token)?
-            .text()
-            .map_err(|error| error.to_string())?;
-        let release: Release =
-            serde_json::from_str(&release_text).map_err(|error| error.to_string())?;
-        if !is_newer(&release.tag_name, current_version()) {
-            set_status(
-                Some(&app),
-                UpdateStatus::new("idle", Some(release.tag_name), None),
-            );
-            return Ok(());
-        }
-        let latest = release.tag_name.clone();
-        let asset = pick_asset(&release.assets).ok_or_else(|| "Release 缺少 app.exe".to_owned())?;
-        let checksum = release
-            .assets
-            .iter()
-            .find(|candidate| candidate.name == "app.exe.sha256")
-            .ok_or_else(|| "Release 缺少 app.exe.sha256".to_owned())?;
-        set_status(
-            Some(&app),
-            UpdateStatus::new("downloading", Some(latest.clone()), None),
-        );
-        let bytes = read_response(get_asset(&client, &asset.url, &token)?, asset.size)
-            .map_err(|error| format!("app.exe {error}"))?;
-        let sha_bytes = read_response(get_asset(&client, &checksum.url, &token)?, checksum.size)
-            .map_err(|error| format!("app.exe.sha256 {error}"))?;
-        let sha_text =
-            String::from_utf8(sha_bytes).map_err(|_| "SHA-256 文件不是有效 UTF-8".to_owned())?;
-        let expected = parse_sha256(&sha_text).ok_or_else(|| "SHA-256 文件格式无效".to_owned())?;
-        if !verify_sha256(&bytes, &expected) {
-            return Err("app.exe SHA-256 校验失败".into());
-        }
-        let new = write_staged(&bytes, &expected, &latest)?;
-        set_status(
-            Some(&app),
-            UpdateStatus::new("ready", Some(latest.clone()), None),
-        );
-        apply(&app, &new, &latest)
-    })();
-    if let Err(error) = result {
-        eprintln!("[update] 更新失败: {error}");
-        if let Ok(dir) = update_dir() {
-            let _ = fs::remove_file(dir.join("app.exe.part"));
-        }
-        set_status(Some(&app), UpdateStatus::new("error", None, Some(error)));
-    }
+    let verdict = run_check(app, automatic, backoff);
     CHECKING.store(false, Ordering::SeqCst);
+    verdict
+}
+
+fn run_check(app: &tauri::AppHandle, automatic: bool, backoff: Duration) -> Verdict {
+    // 公开仓匿名即可检查与下载；令牌（Git 凭据或面板 PAT）仅私有部署需要。
+    let token = token().unwrap_or_default();
+    set_status(Some(app), UpdateStatus::new("checking", None, None));
+    let mut fetcher = match Fetcher::new() {
+        Ok(fetcher) => fetcher,
+        Err(error) => {
+            return fail(app, automatic, backoff, &token, "none", &error);
+        }
+    };
+    let result = perform(app, &mut fetcher, &token);
+    match result {
+        Ok(()) => {
+            log_attempt(fetcher.transport_label(), Some(&token), None);
+            Verdict::Settled
+        }
+        Err(error) => fail(app, automatic, backoff, &token, fetcher.transport_label(), &error),
+    }
+}
+
+/// 失败收口：清理暂存、按自动/手动与分类落状态、写日志，并给出重试裁决。
+/// 自动 + 瞬态 → `retry_wait`（中性）；其余 → `error`（红色，手动检查同此）。
+fn fail(
+    app: &tauri::AppHandle,
+    automatic: bool,
+    backoff: Duration,
+    token: &str,
+    transport: &str,
+    error: &CheckError,
+) -> Verdict {
+    if let Ok(dir) = update_dir() {
+        let _ = fs::remove_file(dir.join("app.exe.part"));
+    }
+    let sanitized = crate::sched::sanitize_sync_error(&error.message, Some(token));
+    if automatic && error.kind.is_retryable() {
+        let next = Local::now()
+            + chrono::Duration::from_std(backoff)
+                .unwrap_or_else(|_| chrono::Duration::zero());
+        let next_hhmm = next.format("%H:%M").to_string();
+        let base = match error.kind {
+            FailureKind::RateLimited => "GitHub 限流",
+            _ => "网络未就绪",
+        };
+        let mut status = UpdateStatus::new(
+            "retry_wait",
+            None,
+            Some(format!("{base}，{next_hhmm} 自动重试")),
+        );
+        status.next_retry = Some(next_hhmm);
+        status.failure_class = Some(error.kind.class().to_owned());
+        status.detail = Some(sanitized.clone());
+        set_status(Some(app), status);
+        log_attempt(transport, Some(token), Some(&sanitized));
+        return Verdict::Transient;
+    }
+    let mut status = UpdateStatus::new("error", None, Some(error.kind.label().to_owned()));
+    status.failure_class = Some(error.kind.class().to_owned());
+    status.detail = Some(sanitized.clone());
+    set_status(Some(app), status);
+    log_attempt(transport, Some(token), Some(&sanitized));
+    Verdict::Settled
+}
+
+/// 常驻循环：首查 +3s；瞬态失败退避重试；其余按 1h 周期复查。
+fn update_loop(app: tauri::AppHandle) {
+    std::thread::sleep(Duration::from_secs(3));
+    let mut step = 0_usize;
+    loop {
+        let backoff = backoff_delay(step);
+        match check_once(&app, true, backoff) {
+            Verdict::Transient => {
+                step = (step + 1).min(BACKOFF_STEPS.len() - 1);
+                std::thread::sleep(backoff);
+            }
+            Verdict::Settled => {
+                step = 0;
+                std::thread::sleep(RECHECK);
+            }
+        }
+    }
 }
 
 pub fn spawn(app: tauri::AppHandle) {
     if enabled() {
-        std::thread::spawn(move || check(app, true));
+        std::thread::spawn(move || update_loop(app));
     }
 }
 
@@ -454,7 +818,7 @@ pub fn update_check_now(app: tauri::AppHandle) -> Result<(), CmdError> {
     if !enabled() {
         return Err(CmdError::bad_request("当前构建未启用自动更新"));
     }
-    std::thread::spawn(move || check(app, false));
+    std::thread::spawn(move || check_once(&app, false, Duration::ZERO));
     Ok(())
 }
 
@@ -592,5 +956,122 @@ mod tests {
     fn redirects_stop_at_five_hops() {
         assert!(may_follow(4));
         assert!(!may_follow(5));
+    }
+
+    #[test]
+    fn status_codes_classify_into_failure_kinds() {
+        use reqwest::StatusCode;
+        assert_eq!(
+            classify_status(StatusCode::UNAUTHORIZED, false),
+            FailureKind::AuthInvalid
+        );
+        assert_eq!(
+            classify_status(StatusCode::NOT_FOUND, false),
+            FailureKind::AuthMissing
+        );
+        assert_eq!(
+            classify_status(StatusCode::TOO_MANY_REQUESTS, false),
+            FailureKind::RateLimited
+        );
+        assert_eq!(
+            classify_status(StatusCode::FORBIDDEN, true),
+            FailureKind::RateLimited
+        );
+        assert_eq!(
+            classify_status(StatusCode::FORBIDDEN, false),
+            FailureKind::Fatal
+        );
+        assert_eq!(
+            classify_status(StatusCode::BAD_GATEWAY, false),
+            FailureKind::Retryable
+        );
+        assert_eq!(
+            classify_status(StatusCode::BAD_REQUEST, false),
+            FailureKind::Fatal
+        );
+    }
+
+    #[test]
+    fn rate_limit_headers_are_detected() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert!(!rate_limited(&headers));
+        headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+        assert!(rate_limited(&headers));
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", "60".parse().unwrap());
+        assert!(rate_limited(&headers));
+    }
+
+    #[test]
+    fn backoff_escalates_and_caps() {
+        assert_eq!(backoff_delay(0), Duration::from_secs(30));
+        assert_eq!(backoff_delay(1), Duration::from_secs(120));
+        assert_eq!(backoff_delay(2), Duration::from_secs(600));
+        assert_eq!(backoff_delay(3), Duration::from_secs(1800));
+        assert_eq!(backoff_delay(99), Duration::from_secs(1800));
+    }
+
+    #[test]
+    fn transport_errors_are_marked_for_fallback() {
+        let error = CheckError::transport("connection refused");
+        assert!(error.transport);
+        assert!(error.kind.is_retryable());
+        assert!(!CheckError::fatal("协议坏").transport);
+        assert!(!CheckError::body("截断").transport);
+        assert!(CheckError::body("截断").kind.is_retryable());
+        assert!(!CheckError::fatal("校验").kind.is_retryable());
+    }
+
+    #[test]
+    fn failure_labels_and_classes_cover_all_kinds() {
+        for kind in [
+            FailureKind::Retryable,
+            FailureKind::RateLimited,
+            FailureKind::AuthMissing,
+            FailureKind::AuthInvalid,
+            FailureKind::Fatal,
+        ] {
+            assert!(!kind.label().is_empty());
+            assert!(!kind.class().is_empty());
+        }
+        assert!(FailureKind::RateLimited.is_retryable());
+        assert!(!FailureKind::AuthInvalid.is_retryable());
+    }
+
+    #[test]
+    fn direct_and_proxy_clients_both_construct() {
+        assert!(build_client(false).is_ok());
+        assert!(build_client(true).is_ok());
+    }
+
+    #[test]
+    fn log_rotation_keeps_last_200_lines() {
+        let path = std::env::temp_dir().join(format!(
+            "sticky-update-log-test-{}.log",
+            std::process::id()
+        ));
+        let mut content = String::new();
+        for index in 0..5000 {
+            content.push_str(&format!("line-{index:04} {}\n", "x".repeat(100)));
+        }
+        fs::write(&path, &content).unwrap();
+        rotate_log(&path);
+        let rotated = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = rotated.lines().collect();
+        assert_eq!(lines.len(), 200);
+        assert!(lines[0].starts_with("line-4800"), "first kept: {}", lines[0]);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn log_rotation_ignores_small_logs() {
+        let path = std::env::temp_dir().join(format!(
+            "sticky-update-log-small-{}.log",
+            std::process::id()
+        ));
+        fs::write(&path, "keep-a\nkeep-b\n").unwrap();
+        rotate_log(&path);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "keep-a\nkeep-b\n");
+        let _ = fs::remove_file(&path);
     }
 }
