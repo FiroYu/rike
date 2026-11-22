@@ -372,11 +372,17 @@ impl StickyStore {
             .map(|at| at.elapsed())
     }
 
-    /// 调度器每周期结束刷新队列深度缓存（P0）。
+    /// 调度器每周期结束刷新队列深度缓存 + 上次同步完成时刻（仅成功周期，
+    /// 「已同步 HH:MM」是成功语义——Gemini 审查 HIGH：失败别刷时间戳）。
     pub(crate) fn set_queue_depth(&self, depth: usize) {
         self.queue_depth.store(depth, Ordering::Relaxed);
         let at = chrono::Local::now().format("%H:%M").to_string();
         *self.last_cycle_at.lock().unwrap_or_else(|p| p.into_inner()) = Some(at);
+    }
+
+    /// 只刷队列深度缓存（失败周期用）：时间戳保持上次成功时刻不动。
+    pub(crate) fn refresh_queue_depth(&self, depth: usize) {
+        self.queue_depth.store(depth, Ordering::Relaxed);
     }
 
     /// 同步健康快照（P0 三态指示）：UI 渲染保存三态/队列徽标/上次同步时间。

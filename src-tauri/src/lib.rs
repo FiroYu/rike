@@ -689,10 +689,16 @@ fn register_hotkey(app: &tauri::App) {
     if let Err(e) = gs.on_shortcut(shortcut, |_app, _sc, event| {
         let pressed = event.state == ShortcutState::Pressed;
         #[cfg(windows)]
-        if pressed && shell::is_sunk() {
+        if pressed {
             if let Some(w) = _app.get_webview_window("sticky") {
-                if let Ok(h) = w.hwnd() {
-                    shell::summon(h.0);
+                // v0.11.0：窗口不可见（沉底外还有 P2 关窗隐藏、全屏看门狗隐藏
+                // 且恢复被 is_sunk 门挡下的搁浅态）时 Alt+S 也必须唤得出——
+                // summon 的 SWP_SHOWWINDOW 自带显示，解除搁浅。
+                let stranded = shell::is_sunk() || !w.is_visible().unwrap_or(true);
+                if stranded {
+                    if let Ok(h) = w.hwnd() {
+                        shell::summon(h.0);
+                    }
                 }
                 let _ = w.set_focus();
             }

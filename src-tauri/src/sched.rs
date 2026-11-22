@@ -337,6 +337,7 @@ fn full_sync(store: &Arc<StickyStore>, timing: &SchedTiming, retry_at: &mut Opti
         Ok(SyncStatus::Pushed { auto_merged, .. }) if !auto_merged.is_empty() => {
             *retry_at = None;
             store.set_status(SyncUiState::Merged { files: auto_merged });
+            store.set_queue_depth(store.engine().queue_depth());
             #[cfg(windows)]
             rollover_rescan(store, emit);
             heartbeat(store);
@@ -344,6 +345,7 @@ fn full_sync(store: &Arc<StickyStore>, timing: &SchedTiming, retry_at: &mut Opti
         Ok(_) => {
             *retry_at = None;
             store.set_status(SyncUiState::Idle);
+            store.set_queue_depth(store.engine().queue_depth());
             #[cfg(windows)]
             rollover_rescan(store, emit);
             heartbeat(store);
@@ -361,12 +363,12 @@ fn full_sync(store: &Arc<StickyStore>, timing: &SchedTiming, retry_at: &mut Opti
             log_err!("[sched] 同步失败，{:?} 后重试: {message}", timing.retry);
             *retry_at = Some(Instant::now() + timing.retry);
             store.set_status(SyncUiState::Error { message });
-            // 失败也刷新快照：离线队列深度此刻最有观测价值（P0/P3）。
-            store.set_queue_depth(store.engine().queue_depth());
-            heartbeat(store);
+            // 失败仍刷新队列深度缓存（P0 观测价值），但不刷「上次同步」时间戳
+            // （那是成功语义）；也不写心跳——离线心跳提交自身会推高 queueDepth，
+            // 每轮重试都触发 stale→新提交→再推高的提交风暴（Gemini 审查 CRITICAL）。
+            store.refresh_queue_depth(store.engine().queue_depth());
         }
     }
-    store.set_queue_depth(store.engine().queue_depth());
     emit_status(store, emit);
 
     let after = store.watched_fingerprints(today());
@@ -394,6 +396,7 @@ fn silent_pull(store: &Arc<StickyStore>, retry_at: &mut Option<Instant>, emit: &
                 store.set_status(SyncUiState::Merged { files: auto_merged });
                 emit_status(store, emit);
             }
+            store.set_queue_depth(store.engine().queue_depth());
             #[cfg(windows)]
             rollover_rescan(store, emit);
             heartbeat(store);
@@ -414,12 +417,11 @@ fn silent_pull(store: &Arc<StickyStore>, retry_at: &mut Option<Instant>, emit: &
             if store.engine().has_local_changes() || unpushed > 0 {
                 *retry_at = Some(Instant::now() + Duration::from_secs(30));
                 store.set_status(SyncUiState::Error { message });
-                store.set_queue_depth(store.engine().queue_depth());
+                store.refresh_queue_depth(store.engine().queue_depth());
                 emit_status(store, emit);
             }
         }
     }
-    store.set_queue_depth(store.engine().queue_depth());
     let after = store.watched_fingerprints(today());
     if after != before {
         if let Ok(p) = serde_json::to_string(&after) {
