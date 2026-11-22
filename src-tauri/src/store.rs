@@ -107,6 +107,26 @@ pub enum SyncUiState {
     Error { message: String },
 }
 
+/// 同步健康快照（P0）：保存三态 + 队列深度 + 上次同步周期完成时刻。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SyncHealthDto {
+    pub state: SyncUiState,
+    pub pending_edits: usize,
+    pub queue_depth: usize,
+    /// 上次同步周期完成时刻（"HH:MM" 本地时区）；启动后尚未跑过周期为 None。
+    pub last_cycle_at: Option<String>,
+}
+
+/// `.machines/<tag>.json` 单机状态（P0 状态面板：各机版本/最后在线/队列深度）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MachineStatusDto {
+    pub tag: String,
+    pub version: Option<String>,
+    pub last_seen: Option<String>,
+    pub os: Option<String>,
+    pub queue_depth: Option<u64>,
+}
+
 
 /// base_version（u64 内容哈希）跨界序列化为字符串：JSON Number 经 JS 往返
 /// 丢失精度（> 2^53），数值回传后必然 stale（2026-09-10 实测：勾选静默丢失）。
@@ -264,6 +284,12 @@ pub struct StickyStore {
     io: Mutex<()>,
     status: Mutex<SyncUiState>,
     pending_edits: AtomicUsize,
+    /// 最后一次编辑落盘的时刻：调度器据此做防抖自动保存（P1）。
+    last_edit_at: Mutex<Option<std::time::Instant>>,
+    /// 离线队列深度缓存 + 最近一次同步周期完成时刻（P0：由调度器每周期刷新，
+    /// UI 直读缓存，不为渲染起 git 进程）。
+    queue_depth: AtomicUsize,
+    last_cycle_at: Mutex<Option<String>>,
     tx: Mutex<Option<Sender<SchedMsg>>>,
     /// 仓库就绪：.git 目录在 clone 中途就会出现（checkout 前），不能作就绪判据；
     /// 首运行由调度线程克隆完成后置位，避免 mid-clone 编辑被 checkout 覆盖丢失。
@@ -279,6 +305,9 @@ impl StickyStore {
             io: Mutex::new(()),
             status: Mutex::new(SyncUiState::Idle),
             pending_edits: AtomicUsize::new(0),
+            last_edit_at: Mutex::new(None),
+            queue_depth: AtomicUsize::new(0),
+            last_cycle_at: Mutex::new(None),
             tx: Mutex::new(None),
             repo_ready: AtomicBool::new(ready),
         }
@@ -322,7 +351,73 @@ impl StickyStore {
     /// 非命令层的批量写入（跨日流转）完成后计入待同步编辑数。
     #[cfg(windows)]
     pub(crate) fn add_pending_edits(&self, n: usize) {
+        self.note_edits(n);
+    }
+
+    /// 命令层单次编辑落盘后调用：计数 + 刷新编辑时刻（防抖自动保存的依据）。
+    pub(crate) fn note_edit(&self) {
+        self.note_edits(1);
+    }
+
+    fn note_edits(&self, n: usize) {
         self.pending_edits.fetch_add(n, Ordering::Relaxed);
+        *self.last_edit_at.lock().unwrap_or_else(|p| p.into_inner()) = Some(std::time::Instant::now());
+    }
+
+    /// 距最后一次编辑的时长；从未编辑过返回 None。
+    pub fn last_edit_elapsed(&self) -> Option<std::time::Duration> {
+        self.last_edit_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .map(|at| at.elapsed())
+    }
+
+    /// 调度器每周期结束刷新队列深度缓存（P0）。
+    pub(crate) fn set_queue_depth(&self, depth: usize) {
+        self.queue_depth.store(depth, Ordering::Relaxed);
+        let at = chrono::Local::now().format("%H:%M").to_string();
+        *self.last_cycle_at.lock().unwrap_or_else(|p| p.into_inner()) = Some(at);
+    }
+
+    /// 同步健康快照（P0 三态指示）：UI 渲染保存三态/队列徽标/上次同步时间。
+    /// pending>0=本地已存待提交；queue>0=已提交未推送；双双归零=main 已确认。
+    pub fn sync_health(&self) -> SyncHealthDto {
+        SyncHealthDto {
+            state: self.status(),
+            pending_edits: self.pending_edit_count(),
+            queue_depth: self.queue_depth.load(Ordering::Relaxed),
+            last_cycle_at: self
+                .last_cycle_at
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone(),
+        }
+    }
+
+    /// 同步仓 `.machines/*.json` 全表（P0 状态面板：各机版本/最后在线/队列深度）。
+    pub fn machines_status(&self) -> Vec<MachineStatusDto> {
+        let dir = self.engine.repo_dir().join(".machines");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<MachineStatusDto> = entries
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .filter_map(|e| {
+                let tag = e.path().file_stem()?.to_string_lossy().into_owned();
+                let body = std::fs::read_to_string(e.path()).ok()?;
+                let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+                Some(MachineStatusDto {
+                    tag,
+                    version: v.get("version").and_then(|x| x.as_str()).map(str::to_owned),
+                    last_seen: v.get("lastSeen").and_then(|x| x.as_str()).map(str::to_owned),
+                    os: v.get("os").and_then(|x| x.as_str()).map(str::to_owned),
+                    queue_depth: v.get("queueDepth").and_then(|x| x.as_u64()),
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| a.tag.cmp(&b.tag));
+        out
     }
 
     pub(crate) fn io_lock(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -387,7 +482,7 @@ impl StickyStore {
         self.ensure_repo_ready()?;
         let _g = self.io_lock();
         let book = notebook::save(self.engine.repo_dir(), id, name, base_version)?;
-        self.pending_edits.fetch_add(1, Ordering::Relaxed);
+        self.note_edit();
         Ok(book)
     }
 
@@ -506,7 +601,7 @@ impl StickyStore {
             notebook::atomic_write(&path, &content)?;
             hash_text(&content)
         };
-        self.pending_edits.fetch_add(1, Ordering::Relaxed);
+        self.note_edit();
         Ok(EditResult { base_version: version })
     }
 
@@ -553,7 +648,7 @@ impl StickyStore {
         let dir = notebook::root(self.engine.repo_dir(), notebook)?.join(stickies::rel_dir(date));
         std::fs::create_dir_all(&dir).map_err(|e| CmdError::internal(format!("创建便签目录失败: {e}")))?;
         let id = create_sticky_with_retry(&dir, &content, stickies::new_id)?;
-        self.pending_edits.fetch_add(1, Ordering::Relaxed);
+        self.note_edit();
         Ok(StickyCreatedDto { id, date: crate::repo::fmt_date(date), base_version: hash_text(&content) })
     }
 
@@ -570,7 +665,7 @@ impl StickyStore {
         };
         if hash_text(&current) != base_version { return Err(CmdError::stale()); }
         notebook::atomic_write(&path, &content)?;
-        self.pending_edits.fetch_add(1, Ordering::Relaxed);
+        self.note_edit();
         Ok(EditResult { base_version: hash_text(&content) })
     }
 
@@ -586,7 +681,7 @@ impl StickyStore {
         };
         if hash_text(&content) != base_version { return Err(CmdError::stale()); }
         std::fs::remove_file(&path).map_err(|e| CmdError::internal(format!("删除便签失败: {e}")))?;
-        self.pending_edits.fetch_add(1, Ordering::Relaxed);
+        self.note_edit();
         Ok(StickyDeletedDto { base_version, removed_content: content })
     }
 
@@ -604,7 +699,7 @@ impl StickyStore {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(CmdError { code: "stale", message: "便签已存在，无法撤销恢复".into() }),
             Err(e) => return Err(CmdError::internal(format!("恢复便签失败: {e}"))),
         }
-        self.pending_edits.fetch_add(1, Ordering::Relaxed);
+        self.note_edit();
         Ok(EditResult { base_version: hash_text(&content) })
     }
 
@@ -649,7 +744,7 @@ impl StickyStore {
                 .map_err(|e| CmdError::internal(format!("建目录失败: {e}")))?;
         }
         notebook::atomic_write(&path, &out)?;
-        self.pending_edits.fetch_add(1, Ordering::Relaxed);
+        self.note_edit();
         Ok(hash_text(&out))
     }
 
@@ -702,7 +797,7 @@ impl StickyStore {
         let out = file.serialize();
         let path = kind.abs_path(&notebook::root(self.engine.repo_dir(), notebook)?);
         notebook::atomic_write(&path, &out)?;
-        self.pending_edits.fetch_add(1, Ordering::Relaxed);
+        self.note_edit();
         Ok(EditResult { base_version: hash_text(&out) })
     }
 

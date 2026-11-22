@@ -11,8 +11,10 @@ import {
   ApiError,
   api,
   type DeleteResult,
+  type MachineStatus,
   type Notebook,
   type TaskView,
+  type SyncHealth,
   type SyncState,
   type ViewDto,
   type ViewKind,
@@ -2030,13 +2032,69 @@ void (async () => {
   message: "无法读取或监听同步状态，请重启工具后重试",
 }));
 // 本机提交身份保留在同步提示中，页脚留给常用入口。
+let footBaseTitle = "点击立即同步";
 void api
   .machineTag()
   .then((t) => {
     root.querySelector<HTMLElement>("#sync-tag")!.textContent = `sticky@${t}`;
-    root.querySelector<HTMLElement>(".foot")!.title = `点击立即同步 · sticky@${t}`;
+    footBaseTitle = `点击立即同步 · sticky@${t}`;
+    root.querySelector<HTMLElement>(".foot")!.title = footBaseTitle;
   })
   .catch(() => {});
+
+// ---- P0 同步健康：保存三态 + 队列徽标 + 各机 lastSeen（悬停提示） ----
+// 2s 轮询读后端缓存（零 git 开销）；仅在 idle 态接管文案，不覆盖事件驱动的
+// 同步中/冲突/合并等瞬态。每 6 拍（12s）刷新一次各机心跳。
+const syncTextEl = root.querySelector<HTMLElement>("#sync-text")!;
+const syncDotEl = root.querySelector<HTMLElement>("#sync-dot")!;
+const footEl = root.querySelector<HTMLElement>(".foot")!;
+let healthTick = 0;
+function renderHealth(health: SyncHealth, machines: MachineStatus[] | null): void {
+  if (health.state.kind !== "idle") return; // 瞬态交给 sync-status 事件渲染
+  const pending = health.pending_edits;
+  const queued = health.queue_depth;
+  if (pending > 0) {
+    syncTextEl.textContent = `本地已存 · 待提交 ${pending}`;
+    syncDotEl.dataset.state = "pending";
+  } else if (queued > 0) {
+    syncTextEl.textContent = `已提交 · 待推送 ${queued}`;
+    syncDotEl.dataset.state = "pending";
+  } else {
+    syncTextEl.textContent = health.last_cycle_at ? `已同步 ${health.last_cycle_at}` : "已同步";
+    syncDotEl.dataset.state = "idle";
+  }
+  if (machines) {
+    const lines = machines
+      .map((m) => {
+        const seen = m.last_seen ? m.last_seen.slice(5, 16).replace("T", " ") : "—";
+        const depth = m.queue_depth && m.queue_depth > 0 ? ` · 待推 ${m.queue_depth}` : "";
+        return `${m.tag} · ${m.version ?? "?"} · ${seen}${depth}`;
+      })
+      .join("\n");
+    footEl.title = `${footBaseTitle}\n\n各机状态（版本 · 最后在线）\n${lines}`;
+  }
+}
+setInterval(() => {
+  healthTick += 1;
+  const wantMachines = healthTick % 6 === 1;
+  void api.syncHealth()
+    .then((health) => {
+      if (!wantMachines) return renderHealth(health, null);
+      return api.machinesStatus()
+        .then((machines) => renderHealth(health, machines))
+        .catch(() => renderHealth(health, null));
+    })
+    .catch(() => {}); // 仓库未就绪等：静默，事件通道会另行报错
+}, 2000);
+
+// ---- P0 获焦拉取：窗口获得焦点即触发一轮完整同步（30s 节流） ----
+let lastFocusSync = 0;
+window.addEventListener("focus", () => {
+  const now = Date.now();
+  if (now - lastFocusSync < 30_000) return;
+  lastFocusSync = now;
+  void api.syncNow().catch(() => {});
+});
 void refresh(); // 仓库已就绪时立即出数据（repo-ready 可能已错过）
 rerender();
 }

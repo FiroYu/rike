@@ -585,6 +585,8 @@ button:focus-visible, input:focus-visible, summary:focus-visible, [tabindex]:foc
 }
 .dot[data-state="idle"] { background: var(--ok); }
 .dot[data-state="merged"] { background: var(--ok); box-shadow: 0 0 0 2px color-mix(in srgb, var(--ok) 35%, transparent); }
+/* P0 队列态：待提交/待推送——主题中性的墨色+光环（注意而非错误）。 */
+.dot[data-state="pending"] { background: var(--ink-3); box-shadow: 0 0 0 2px color-mix(in srgb, var(--ink-3) 30%, transparent); }
 .dot[data-state="syncing"] { background: var(--ink-3); animation: pulse 1.2s infinite; }
 .dot[data-state="offline"] { background: transparent; border: 1.5px solid var(--ink-3); }
 .dot[data-state="conflict"], .dot[data-state="error"] { background: var(--accent); }

@@ -1,13 +1,15 @@
-//! 后台同步调度线程（2026-09-10 用户反馈后调整：编辑不再即时同步，太慢）：
+//! 后台同步调度线程（v0.11.0 P1：编辑防抖自动保存，替代 30min 攒批）：
 //!
 //! | 事件 | 动作 |
 //! |---|---|
+//! | 编辑静默 ≥3s 且有待同步编辑 | 立即完整同步（防抖自动保存） |
 //! | 每 30min tick | 有本地改动 → 完整同步（自动保存）；无 → 静默 pull |
 //! | 同步失败（非冲突） | 30s 后重试（PRD：恢复后 ≤60s 补推） |
 //! | 手动同步（F20，点角标） | 立即完整同步 |
 //! | 退出（FlushNow） | 最后一次完整同步后收线程 |
 //!
-//! 编辑只落工作区 + pending_edits 计数，由 tick / 手动 / 退出统一推走。
+//! 2026-09-10 曾因「逐次即时同步太慢」改为攒批；v0.11.0 用 3s 防抖折中：
+//! 编辑持续期间不打断（staged 同步的 fetch 段不持 io 锁），静默后秒级推走。
 //! 冲突不自动重试（push 被拒的 rebase 重试已内含在 sync_cycle；真冲突需人工处理）。
 //! 全部 git 周期持 store 的 io 锁，与编辑的读-改-写互斥（v1 正确性优先，秒级可接受）。
 
@@ -35,6 +37,9 @@ pub struct SchedTiming {
     pub retry: Duration,
     /// 轮询粒度
     pub poll: Duration,
+    /// 编辑防抖：最后一次编辑静默超过该时长且仍有待同步编辑 → 立即完整同步
+    /// （P1：替代「攒到 30min tick」的延迟批量，冲突窗口从小时级压到秒级）
+    pub edit_debounce: Duration,
 }
 
 impl Default for SchedTiming {
@@ -43,6 +48,7 @@ impl Default for SchedTiming {
             tick: Duration::from_secs(1800),
             retry: Duration::from_secs(30),
             poll: Duration::from_millis(500),
+            edit_debounce: Duration::from_secs(3),
         }
     }
 }
@@ -224,17 +230,23 @@ fn run_loop(store: &Arc<StickyStore>, timing: &SchedTiming, emit: &EmitFn, rx: &
         let now = Instant::now();
         let tick = now.duration_since(last_tick) >= timing.tick;
         let retry = retry_at.is_some_and(|at| now >= at);
+        // 防抖自动保存（P1）：有待同步编辑且编辑已静默 ≥edit_debounce → 立即完整同步。
+        // 只读内存计数与时间戳，不为此在每个 poll 周期起 git 进程。
+        let debounce = store.pending_edit_count() > 0
+            && store.last_edit_elapsed().is_some_and(|e| e >= timing.edit_debounce);
         if tick {
             last_tick = now;
         }
-        if manual || tick || retry {
+        if manual || tick || retry || debounce {
             let recovered = !ready;
             if !ready {
                 ready = ensure_repo(store, &mut retry_at, timing, emit, url);
             }
             // 校验失败时，手动、tick、重试和退出都不能绕过仓库门禁。
             if ready {
-                if manual || recovered || retry_at.is_some() || store.engine().has_local_changes() {
+                if manual || recovered || retry_at.is_some() || debounce
+                    || store.engine().has_local_changes()
+                {
                     full_sync(store, timing, &mut retry_at, emit);
                 } else {
                     silent_pull(store, &mut retry_at, emit);
@@ -349,8 +361,12 @@ fn full_sync(store: &Arc<StickyStore>, timing: &SchedTiming, retry_at: &mut Opti
             log_err!("[sched] 同步失败，{:?} 后重试: {message}", timing.retry);
             *retry_at = Some(Instant::now() + timing.retry);
             store.set_status(SyncUiState::Error { message });
+            // 失败也刷新快照：离线队列深度此刻最有观测价值（P0/P3）。
+            store.set_queue_depth(store.engine().queue_depth());
+            heartbeat(store);
         }
     }
+    store.set_queue_depth(store.engine().queue_depth());
     emit_status(store, emit);
 
     let after = store.watched_fingerprints(today());
@@ -398,10 +414,12 @@ fn silent_pull(store: &Arc<StickyStore>, retry_at: &mut Option<Instant>, emit: &
             if store.engine().has_local_changes() || unpushed > 0 {
                 *retry_at = Some(Instant::now() + Duration::from_secs(30));
                 store.set_status(SyncUiState::Error { message });
+                store.set_queue_depth(store.engine().queue_depth());
                 emit_status(store, emit);
             }
         }
     }
+    store.set_queue_depth(store.engine().queue_depth());
     let after = store.watched_fingerprints(today());
     if after != before {
         if let Ok(p) = serde_json::to_string(&after) {

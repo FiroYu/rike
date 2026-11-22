@@ -254,6 +254,7 @@ fn fast_timing() -> SchedTiming {
         tick: Duration::from_secs(10),
         retry: Duration::from_secs(5),
         poll: Duration::from_millis(20),
+        edit_debounce: Duration::from_secs(10),
     }
 }
 
@@ -329,6 +330,50 @@ fn scheduler_stop_flushes_pending_edit() {
     assert!(last_msg.starts_with("sticky@"), "commit 前缀: {last_msg}");
 }
 
+/// P1（v0.11.0）：编辑静默 ≥edit_debounce 后自动 commit+push，无需手动/等待 tick。
+/// 时序要点：先等启动同步完成（idle）再编辑——否则编辑会被启动同步顺带推走，
+/// 测不出防抖路径本身（与 manual_sync_now_pushes_edit 同一前提）。
+#[test]
+fn edit_debounce_auto_pushes_without_manual_sync() {
+    let (a, url) = setup_store("sched-debounce");
+    let store = Arc::new(StickyStore::new(&a));
+    let (ev, emit) = collector();
+    let timing = SchedTiming {
+        // tick 远大于测试窗口：证明推送来自防抖而非 tick。
+        tick: Duration::from_secs(600),
+        retry: Duration::from_secs(5),
+        poll: Duration::from_millis(20),
+        edit_debounce: Duration::from_millis(300),
+    };
+    let sched = sched::spawn_with_repo_url(store.clone(), timing, emit, url);
+
+    let day = FileKind::Day(d("2026-09-10"));
+    assert!(
+        wait_until(Duration::from_secs(15), || ev
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(e, p)| e == "sync-status" && p.contains("\"idle\""))),
+        "启动同步应在预算内完成"
+    );
+    store.add_task("default", &day, Category::Work, Priority::P1, "防抖任务", &[], 0).unwrap();
+    // 防抖窗口内（300ms）不打断：此断言允许 0~300ms 内尚未推送，仅要求
+    // 窗口过后在预算内完成自动推送（CI 慢机器放宽到 20s，与 flush 测试同档）。
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            git(&a, &["log", "-1", "--format=%s"]).starts_with("sticky@")
+                && store.engine().unpushed_count().unwrap_or(1) == 0
+        }),
+        "编辑静默超过防抖窗口后应自动 commit+push，status={:?}",
+        store.status()
+    );
+    assert!(
+        wait_until(Duration::from_secs(2), || store.status() == SyncUiState::Idle),
+        "自动同步完成后状态应回 Idle"
+    );
+    sched.stop(Duration::from_secs(5));
+}
+
 #[test]
 fn wrong_origin_blocks_startup_manual_retry_tick_and_exit_sync() {
     let (a, _) = setup_store("wrong-origin-gate");
@@ -340,6 +385,7 @@ fn wrong_origin_blocks_startup_manual_retry_tick_and_exit_sync() {
         tick: Duration::from_millis(150),
         retry: Duration::from_millis(100),
         poll: Duration::from_millis(20),
+        edit_debounce: Duration::from_secs(5),
     };
     let sched = sched::spawn_with_repo_url(store.clone(), timing, emit, "file:///unexpected-journal.git".into());
     assert!(wait_until(Duration::from_secs(3), || matches!(store.status(), SyncUiState::Error { .. })));
@@ -365,6 +411,7 @@ fn scheduler_tick_silent_pulls_remote_changes() {
         tick: Duration::from_millis(200),
         retry: Duration::from_secs(5),
         poll: Duration::from_millis(20),
+        edit_debounce: Duration::from_secs(5),
     };
     let sched = sched::spawn_with_repo_url(store.clone(), timing, emit, url.clone());
 

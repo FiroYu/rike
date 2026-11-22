@@ -575,6 +575,18 @@ fn sync_status(state: tauri::State<StoreState>) -> store::SyncUiState {
     state.status()
 }
 
+/// P0：保存三态/队列深度/上次同步时刻（读缓存，不起 git 进程）。
+#[tauri::command]
+fn sync_health(state: tauri::State<StoreState>) -> store::SyncHealthDto {
+    state.sync_health()
+}
+
+/// P0：同步仓 `.machines` 全表（各机版本/最后在线/队列深度）。
+#[tauri::command]
+fn machines_status(state: tauri::State<StoreState>) -> Vec<store::MachineStatusDto> {
+    state.machines_status()
+}
+
 /// 本机提交身份（页脚右下角展示，如 sticky@<machine>）。
 #[tauri::command]
 fn machine_tag() -> String {
@@ -614,9 +626,55 @@ fn setup_shell(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     update::spawn(app.handle().clone());
 
     #[cfg(desktop)]
+    {
+        // P2 托盘常驻：X 只隐藏后，托盘是唤出与真退出的唯一可靠入口。
+        use tauri::menu::{Menu, MenuItem};
+        use tauri::tray::{TrayIconBuilder, TrayIconEvent};
+        use tauri::Manager;
+        let show = MenuItem::with_id(app, "tray-show", "显示日課", true, None::<&str>)?;
+        let sync = MenuItem::with_id(app, "tray-sync", "立即同步", true, None::<&str>)?;
+        let quit = MenuItem::with_id(app, "tray-quit", "退出（同步后结束）", true, None::<&str>)?;
+        let menu = Menu::with_items(app, &[&show, &sync, &quit])?;
+        let icon = app.default_window_icon().cloned().ok_or("缺少应用图标")?;
+        let tray = TrayIconBuilder::with_id("sticky-tray")
+            .icon(icon)
+            .tooltip("日課")
+            .menu(&menu)
+            .show_menu_on_left_click(false)
+            .on_menu_event(|app, event| match event.id.as_ref() {
+                "tray-show" => show_sticky(app),
+                "tray-sync" => {
+                    app.state::<StoreState>().request_sync_now();
+                }
+                "tray-quit" => app.exit(0),
+                _ => {}
+            })
+            .on_tray_icon_event(|tray, event| {
+                if matches!(event, TrayIconEvent::Click { button: tauri::tray::MouseButton::Left, button_state: tauri::tray::MouseButtonState::Up, .. }) {
+                    show_sticky(tray.app_handle());
+                }
+            })
+            .build(app)?;
+        app.manage(tray); // 托盘句柄交给应用状态持有，防止 drop 撤下图标
+    }
+
+    #[cfg(desktop)]
     register_hotkey(app);
 
     Ok(())
+}
+
+/// 托盘唤出主窗：显示 + 边缘隐藏态复位 + 聚焦（与单实例回调同一套路）。
+fn show_sticky(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(win) = app.get_webview_window("sticky") {
+        let _ = win.show();
+        #[cfg(windows)]
+        if let Ok(h) = win.hwnd() {
+            edge_hide::ensure_shown(h.0);
+        }
+        let _ = win.set_focus();
+    }
 }
 
 /// Alt+S 全局热键：桌面专属能力（移动端不注册插件，编译期排除）。
@@ -718,6 +776,8 @@ pub fn run() {
             set_blocked,
             add_task,
             sync_now,
+            sync_health,
+            machines_status,
             sync_config::get_sync_config,
             sync_config::set_sync_config,
             #[cfg(windows)]
@@ -749,11 +809,21 @@ pub fn run() {
                     }
                 }
             }
-            // sticky 销毁即整体退出：board-editor 的关闭被拦截为 hide 永不销毁，
-            // 只关 sticky 时「最后一窗关闭」的 ExitRequested(code:None) 不会触发，
-            // 进程残留成僵尸——单实例回调拿不到 sticky，桌面快捷方式从此点不开
-            //（2026-10-07 实测命中）。主窗口即应用生命周期：Destroyed 主动走
-            // exit(0) → ExitRequested(code:Some(0)) 进入下方 flush 通道。
+            // P2 托盘常驻：点 X 只隐藏不销毁——同步调度线程继续运行，离线队列
+            // 持续冲刷（编辑搁浅事故的根修）。真退出走托盘菜单「退出」→
+            // app.exit(0) → ExitRequested(code:Some(0)) → 下方 flush 通道。
+            if window.label() == "sticky" {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    if let Err(error) = window.hide() {
+                        log_err!("hide sticky on close failed: {error}");
+                    }
+                }
+            }
+            // sticky 销毁即整体退出：board-editor 的关闭被拦截为 hide 永不销毁；
+            // sticky 的关闭上方也拦截为 hide，Destroyed 只在真退出路径出现
+            // （app.exit / updater 换入重启）。主窗口即应用生命周期：
+            // Destroyed 主动 exit(0) → ExitRequested(code:Some(0)) 进入 flush 通道。
             if window.label() == "sticky" {
                 if let tauri::WindowEvent::Destroyed = event {
                     window.app_handle().exit(0);

@@ -1,7 +1,7 @@
 {
   "name": "rike",
   "private": true,
-  "version": "0.10.3",
+  "version": "0.11.0",
   "description": "日課 — Windows desktop sticky todo with git sync",
   "license": "MIT",
   "repository": {

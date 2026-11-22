@@ -85,6 +85,23 @@ export type SyncState =
   | { kind: "merged"; files: string[] }
   | { kind: "error"; message: string };
 
+/** P0 同步健康快照：保存三态 + 队列深度 + 上次同步周期完成时刻。 */
+export interface SyncHealth {
+  state: SyncState;
+  pending_edits: number;
+  queue_depth: number;
+  last_cycle_at: string | null;
+}
+
+/** P0 各机心跳状态（同步仓 .machines/*.json）。 */
+export interface MachineStatus {
+  tag: string;
+  version: string | null;
+  last_seen: string | null;
+  os: string | null;
+  queue_depth: number | null;
+}
+
 export interface UpdateStatus {
   current: string;
   latest: string | null;
@@ -233,6 +250,8 @@ export const api = {
   updateStatus: () => call<UpdateStatus>("update_status"),
   updateCheckNow: () => call<void>("update_check_now"),
   syncStatus: () => call<SyncState>("sync_status"),
+  syncHealth: () => call<SyncHealth>("sync_health"),
+  machinesStatus: () => call<MachineStatus[]>("machines_status"),
   machineTag: () => call<string>("machine_tag"),
   shellSink: () => call<null>("shell_sink"),
   setBodyHeight: (height: number) => call<null>("set_body_height", { height }),

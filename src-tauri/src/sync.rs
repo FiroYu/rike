@@ -77,8 +77,16 @@ fn heartbeat_file_tag(tag: &str) -> String {
     trimmed.chars().take(40).collect()
 }
 
-/// 心跳是否过期：文件缺失/损坏、版本不一致或 lastSeen 非今日 → 需要更新。
-fn heartbeat_is_stale(content: Option<&str>, version: &str, today: chrono::NaiveDate) -> bool {
+/// 心跳是否过期（P3）：文件缺失/损坏、版本不一致、queueDepth 变化（含字段缺失的
+/// 旧心跳）、lastSeen 非今日，或 lastSeen 距 now ≥30min → 需要更新。
+/// 分钟级刷新让看门狗能判「调度线程死亡/离线」，限频又避免每次同步都产生提交。
+fn heartbeat_is_stale(
+    content: Option<&str>,
+    version: &str,
+    today: chrono::NaiveDate,
+    now: chrono::NaiveDateTime,
+    depth: usize,
+) -> bool {
     let Some(content) = content else {
         return true;
     };
@@ -88,11 +96,20 @@ fn heartbeat_is_stale(content: Option<&str>, version: &str, today: chrono::Naive
     if value.get("version").and_then(|v| v.as_str()) != Some(version) {
         return true;
     }
-    let prefix = today.format("%Y-%m-%d").to_string();
-    match value.get("lastSeen").and_then(|v| v.as_str()) {
-        Some(seen) => !seen.starts_with(&prefix),
-        None => true,
+    if value.get("queueDepth").and_then(|v| v.as_u64()) != Some(depth as u64) {
+        // 深度回落（3→0）必须尽快上屏，否则看门狗把已恢复机器继续当积压机器。
+        return true;
     }
+    let Some(seen) = value.get("lastSeen").and_then(|v| v.as_str()) else {
+        return true;
+    };
+    let Ok(seen) = chrono::NaiveDateTime::parse_from_str(seen, "%Y-%m-%dT%H:%M") else {
+        return true;
+    };
+    if seen.date() != today {
+        return true;
+    }
+    (now - seen).num_minutes() >= 30
 }
 
 /// 一次同步周期的结果。
@@ -267,6 +284,11 @@ impl SyncEngine {
         self.backend.has_local_changes(&self.repo_dir)
     }
 
+    /// 离线队列深度（P3 心跳字段）：已提交未推送数 + 工作区有无未提交改动。
+    pub fn queue_depth(&self) -> usize {
+        self.unpushed_count().unwrap_or(0) + usize::from(self.has_local_changes())
+    }
+
     /// 完整周期：commit → pull → push（顺序即正确性：工作区常有未提交的
     /// tracked 改动，先 pull --rebase 会因 "unstaged changes" exit 128 死循环；
     /// 先 commit 后 rebase 才能安全收敛多端历史）。离线积压的本地提交也会被推送。
@@ -328,8 +350,8 @@ impl SyncEngine {
         Ok(auto_merged)
     }
 
-    /// 同步仓库根 `.machines/<tag>.json` 心跳：文件缺失、版本不同或 lastSeen
-    /// 非今日时写入并走既有提交流程（每机每日 ≤1 条额外提交；每机独立文件，
+    /// 同步仓库根 `.machines/<tag>.json` 心跳（P3）：版本变化、queueDepth 变化、
+    /// 跨日或 lastSeen 停更 ≥30min 时写入并走既有提交流程（每机独立文件，
     /// tag 经 `heartbeat_file_tag` 净化后唯一，git 合并天然不相交）。
     /// 返回是否写入。提交失败时文件留在工作区，由下一轮同步顺带推走。
     pub fn heartbeat_if_stale(&self, io: &std::sync::Mutex<()>) -> Result<bool, SyncError> {
@@ -340,14 +362,17 @@ impl SyncEngine {
         let dir = self.repo_dir.join(".machines");
         let path = dir.join(format!("{tag}.json"));
         let existing = std::fs::read_to_string(&path).ok();
-        let today = chrono::Local::now().date_naive();
-        if !heartbeat_is_stale(existing.as_deref(), env!("CARGO_PKG_VERSION"), today) {
+        let now = chrono::Local::now();
+        let today = now.date_naive();
+        let depth = self.queue_depth();
+        if !heartbeat_is_stale(existing.as_deref(), env!("CARGO_PKG_VERSION"), today, now.naive_local(), depth) {
             return Ok(false);
         }
         let payload = serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
-            "lastSeen": chrono::Local::now().format("%Y-%m-%dT%H:%M").to_string(),
+            "lastSeen": now.format("%Y-%m-%dT%H:%M").to_string(),
             "os": std::env::consts::OS,
+            "queueDepth": depth,
         });
         let body = serde_json::to_string_pretty(&payload)
             .map(|pretty| format!("{pretty}\n"))
@@ -359,20 +384,34 @@ impl SyncEngine {
         Ok(true)
     }
 
+    /// push 被拒 → fetch+rebase 后重试，指数退避（P1）：立即 / 200ms / 800ms / 2000ms
+    /// 共 4 次尝试。rebase 真冲突立即上抛（人工态），不做无意义重试；
+    /// 4 连拒说明远端高频前进，交还上层 30s 失败重试节奏。
     fn push_staged(&self, io: &std::sync::Mutex<()>) -> Result<bool, SyncError> {
-        match self.backend.push(&self.repo_dir) {
-            Ok(()) => Ok(false),
-            Err(SyncError::Git(detail)) if is_push_rejected(&detail) => {
-                self.backend.fetch(&self.repo_dir)?;
-                {
-                    let _g = io.lock().unwrap_or_else(|p| p.into_inner());
-                    self.backend.rebase(&self.repo_dir)?;
-                }
-                self.backend.push(&self.repo_dir)?;
-                Ok(true)
+        let mut rebased = false;
+        for backoff in [
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(200),
+            std::time::Duration::from_millis(800),
+            std::time::Duration::from_millis(2000),
+        ] {
+            if !backoff.is_zero() {
+                std::thread::sleep(backoff);
             }
-            Err(e) => Err(e),
+            match self.backend.push(&self.repo_dir) {
+                Ok(()) => return Ok(rebased),
+                Err(SyncError::Git(detail)) if is_push_rejected(&detail) => {
+                    self.backend.fetch(&self.repo_dir)?;
+                    {
+                        let _g = io.lock().unwrap_or_else(|p| p.into_inner());
+                        self.backend.rebase(&self.repo_dir)?;
+                    }
+                    rebased = true;
+                }
+                Err(e) => return Err(e),
+            }
         }
+        Err(SyncError::Git("push 连续 4 次被拒（远端高频前进），等待下轮失败重试".into()))
     }
 }
 
@@ -1856,21 +1895,31 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_staleness_follows_version_and_date() {
-        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 26).unwrap();
-        let fresh = r#"{"version":"0.10.3","lastSeen":"2026-10-26T12:34","os":"windows"}"#;
-        let old_day = r#"{"version":"0.10.3","lastSeen":"2026-10-25T23:59","os":"windows"}"#;
-        let old_version = r#"{"version":"0.10.2","lastSeen":"2026-10-26T12:34","os":"windows"}"#;
-        assert!(!heartbeat_is_stale(Some(fresh), "0.10.3", today));
-        assert!(heartbeat_is_stale(None, "0.10.3", today));
-        assert!(heartbeat_is_stale(Some(old_day), "0.10.3", today));
-        assert!(heartbeat_is_stale(Some(old_version), "0.10.3", today));
-        assert!(heartbeat_is_stale(Some("not json"), "0.10.3", today));
-        assert!(heartbeat_is_stale(Some(r#"{"version":"0.10.3"}"#), "0.10.3", today));
+    fn heartbeat_staleness_follows_version_date_depth_and_freshness() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 11, 22).unwrap();
+        let now = chrono::NaiveDateTime::parse_from_str("2026-11-22T12:34", "%Y-%m-%dT%H:%M").unwrap();
+        let fresh = r#"{"version":"0.11.0","lastSeen":"2026-11-22T12:20","os":"windows","queueDepth":0}"#;
+        let old_day = r#"{"version":"0.11.0","lastSeen":"2026-11-21T23:59","os":"windows","queueDepth":0}"#;
+        let old_version = r#"{"version":"0.10.3","lastSeen":"2026-11-22T12:20","os":"windows","queueDepth":0}"#;
+        let stale_30min = r#"{"version":"0.11.0","lastSeen":"2026-11-22T11:34","os":"windows","queueDepth":0}"#;
+        let depth_changed = r#"{"version":"0.11.0","lastSeen":"2026-11-22T12:20","os":"windows","queueDepth":3}"#;
+        let no_depth_field = r#"{"version":"0.11.0","lastSeen":"2026-11-22T12:20","os":"windows"}"#;
+        let edge_29min = r#"{"version":"0.11.0","lastSeen":"2026-11-22T12:05","os":"windows","queueDepth":0}"#;
+        assert!(!heartbeat_is_stale(Some(fresh), "0.11.0", today, now, 0));
+        assert!(!heartbeat_is_stale(Some(edge_29min), "0.11.0", today, now, 0), "29min 不算停更");
+        assert!(heartbeat_is_stale(None, "0.11.0", today, now, 0));
+        assert!(heartbeat_is_stale(Some(old_day), "0.11.0", today, now, 0));
+        assert!(heartbeat_is_stale(Some(old_version), "0.11.0", today, now, 0));
+        assert!(heartbeat_is_stale(Some(stale_30min), "0.11.0", today, now, 0), "≥30min 必刷新");
+        assert!(heartbeat_is_stale(Some(depth_changed), "0.11.0", today, now, 0), "深度回落须重写");
+        assert!(heartbeat_is_stale(Some(no_depth_field), "0.11.0", today, now, 0), "旧心跳无字段须重写");
+        assert!(heartbeat_is_stale(Some(fresh), "0.11.0", today, now, 3), "深度上升须重写");
+        assert!(heartbeat_is_stale(Some("not json"), "0.11.0", today, now, 0));
+        assert!(heartbeat_is_stale(Some(r#"{"version":"0.11.0"}"#), "0.11.0", today, now, 0));
     }
 
     #[test]
-    fn heartbeat_writes_and_commits_once_per_version_day() {
+    fn heartbeat_writes_limited_and_tracks_queue_depth() {
         let (a, _b, url) = setup_two_party("heartbeat");
         let eng = SyncEngine::new(&a);
         eng.ensure_cloned(&url).unwrap();
@@ -1882,9 +1931,18 @@ mod tests {
         assert!(path.exists());
         let first = std::fs::read_to_string(&path).unwrap();
         assert!(first.contains(&format!("\"version\": \"{}\"", env!("CARGO_PKG_VERSION"))));
+        assert!(first.contains("\"queueDepth\": 0"), "干净树心跳深度为 0");
 
-        // 同日同版本：不再写（每机每日 ≤1 条心跳提交）。
+        // 同日同版本同深度同分钟内：不再写（限频防提交噪声）。
         assert!(!eng.heartbeat_if_stale(&io).unwrap());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
+
+        // 工作区出现未提交改动：queueDepth 变化 → 立即重写（深度上升可见）。
+        let dirty_dir = eng.repo_dir().join("days");
+        std::fs::create_dir_all(&dirty_dir).unwrap();
+        std::fs::write(dirty_dir.join("2099-01-01.md"), "# 2099-01-01\n").unwrap();
+        assert!(eng.heartbeat_if_stale(&io).unwrap());
+        let second = std::fs::read_to_string(&path).unwrap();
+        assert!(second.contains("\"queueDepth\": 1"), "脏树心跳深度为 1");
     }
 }
